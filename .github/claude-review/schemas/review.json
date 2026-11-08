@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "layer": { "type": "string", "enum": ["L1", "L2", "L3"] },
+    "completed": { "type": "boolean" },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string", "enum": ["blocking", "non_blocking"] },
+          "category": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "title": { "type": "string" },
+          "detail": { "type": "string" },
+          "attack_path": { "type": "string", "description": "L2 only. Attacker, entry point, steps and impact of a realistic attack. A blocking L2 finding without it is lowered to non_blocking. Use an empty string elsewhere." },
+          "fix_hint": { "type": "string" },
+          "prior_status": { "type": "string", "enum": ["resolved", "unresolved"] }
+        },
+        "required": ["id", "severity", "category", "file", "line", "title", "detail", "fix_hint"]
+      }
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "criterion": { "type": "string" },
+          "status": { "type": "string", "enum": ["met", "unmet", "unknown"] },
+          "evidence": { "type": "string" },
+          "finding_id": { "type": "string" }
+        },
+        "required": ["criterion", "status", "evidence"]
+      }
+    }
+  },
+  "required": ["layer", "completed", "findings"]
+}

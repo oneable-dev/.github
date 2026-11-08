@@ -1,0 +1,10 @@
+[
+  { "type": "system", "subtype": "init", "session_id": "33333333-cccc-4ccc-8ccc-333333333333" },
+  {
+    "type": "result",
+    "subtype": "error_max_turns",
+    "is_error": true,
+    "session_id": "33333333-cccc-4ccc-8ccc-333333333333",
+    "num_turns": 30
+  }
+]
