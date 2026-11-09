@@ -1,11 +1,12 @@
 /**
  * gitops
  *
- * What: Every git operation the driver performs: protected paths, commits, pushes, credential scrubbing.
- * Why: Fix agents and L0 commands edit a checkout that holds a repository token's reach. Commits must
- *      never carry changes to configuration that would run in a later agent session or workflow, and
- *      pushes must never rewrite history.
- * Not covered: Deciding when to commit (driver.mjs).
+ * What: Every git operation the driver performs: protected paths, local commits, reading the remote branch head,
+ *       credential scrubbing, and preparing the checkout so that a push slot can push.
+ * Why: Fix agents and L0 commands edit a checkout. Commits must never carry changes to configuration that would
+ *      run in a later agent session or workflow. The driver never pushes (it has no write token): a push slot
+ *      does, with the Claude GitHub App token, and the driver only checks the result with `ls-remote`.
+ * Not covered: Deciding when to commit (driver.mjs) and running the push slot (lib/agent.mjs).
  */
 import { createHash } from 'node:crypto';
 import { lstatSync, readdirSync, readFileSync, readlinkSync, rmSync } from 'node:fs';
@@ -206,12 +207,32 @@ export function commitAll(rt, message, skipUntracked = []) {
   return headSha(rt);
 }
 
-/** Non-force push of HEAD to the PR branch. */
-export function pushHead(rt, state) {
+/**
+ * Put the checkout on a local branch named like the pull request branch, and stop repository git hooks from
+ * running. actions/checkout leaves a detached HEAD, and `git push origin HEAD` from a detached HEAD has no branch
+ * to push to. A hooks path of /dev/null keeps .git/hooks and .husky scripts out of the push slot's `git push`.
+ */
+export function prepareCheckoutForPush(rt, headRef) {
+  rt.git(['config', '--local', 'core.hooksPath', '/dev/null']);
+  if (!validBranchName(headRef)) return false;
+  rt.git(['checkout', '-q', '-B', headRef]);
+  return true;
+}
+
+/**
+ * The commit the PR branch points to on GitHub right now (read with the driver's read-only token).
+ * Returns {ok: true, sha} or {ok: false, error}. A branch that is gone is {ok: true, sha: ''}.
+ */
+export function remoteHeadSha(rt, state) {
   if (!validBranchName(state.head_ref)) return { ok: false, error: 'invalid head branch name' };
-  const r = rt.git([...authArgs(rt), 'push', 'origin', `HEAD:refs/heads/${state.head_ref}`], { check: false, timeout: 120000 });
-  if (r.status === 0) return { ok: true };
-  return { ok: false, error: redact(r.stderr.trim().split('\n').slice(-6).join('\n'), rt.secrets).slice(0, 800) };
+  const ref = `refs/heads/${state.head_ref}`;
+  const r = rt.git([...authArgs(rt), 'ls-remote', 'origin', ref], { check: false, timeout: 120000 });
+  if (r.status !== 0) return { ok: false, error: redact(r.stderr.trim().split('\n').slice(-3).join('\n'), rt.secrets).slice(0, 400) || 'ls-remote failed' };
+  for (const line of r.stdout.split('\n')) {
+    const [sha, name] = line.trim().split(/\s+/);
+    if (name === ref && /^[0-9a-f]{40}$/.test(sha || '')) return { ok: true, sha };
+  }
+  return { ok: true, sha: '' };
 }
 
 /** Changed files between two commits (three-dot when `triple` is true). */

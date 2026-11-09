@@ -5,6 +5,8 @@
  *       between slots, and parsing the execution file the action leaves behind.
  * Why: claude-code-action runs once per YAML step, so the driver prepares each slot and reads its result
  *      itself. A missing, stale, errored or unstructured result is "review incomplete", never a pass.
+ *      There are three kinds of slot: review (read-only), fix (edits files, no shell) and push (one fixed
+ *      shell command). Only the push slot ever pushes; it runs with the Claude GitHub App token.
  * Not covered: Folding results into the state (findings.mjs).
  */
 import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,6 +20,10 @@ export const ROOT = fileURLToPath(new URL('../', import.meta.url));
 
 export const REVIEW_TOOLS = 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*)';
 export const FIX_TOOLS = 'Read,Grep,Glob,Edit,MultiEdit,Write';
+export const PUSH_COMMAND = 'git push origin HEAD';
+export const PUSH_TOOLS = `Bash(${PUSH_COMMAND})`;
+export const PUSH_MODEL = 'haiku';
+export const PUSH_MAX_TURNS = 2;
 
 const SAFE_VALUE = /^[A-Za-z0-9._:[\]-]+$/;
 
@@ -34,8 +40,15 @@ export function slotMaxTurns(cfg, role) {
   return turns > 0 ? Math.floor(turns) : 0;
 }
 
-/** claude_args for one slot. Effort and model are left out when the input is empty. */
-export function buildArgs(cfg, { role, layer, inDir }) {
+/**
+ * claude_args for one slot. Effort and model are left out when the input is empty.
+ * `settings` is the path of the slot's Claude settings file (the PreToolUse hook).
+ */
+export function buildArgs(cfg, { role, layer, inDir, settings }) {
+  if (role === 'push') {
+    // No structured output and no input directory: the slot runs one fixed command.
+    return ['--model', PUSH_MODEL, '--max-turns', String(PUSH_MAX_TURNS), '--allowedTools', `"${PUSH_TOOLS}"`, ...(settings ? ['--settings', settings] : [])].join(' ');
+  }
   const review = role === 'review';
   const model = review ? cfg.models[layer] : cfg.fix_model;
   const effort = review ? cfg.review_effort : cfg.fix_effort;
@@ -48,6 +61,7 @@ export function buildArgs(cfg, { role, layer, inDir }) {
   if (!review) parts.push('--permission-mode', 'acceptEdits');
   parts.push('--json-schema', `'${loadSchema(review ? 'review' : 'fix')}'`);
   parts.push('--add-dir', inDir);
+  if (settings) parts.push('--settings', settings);
   return parts.join(' ');
 }
 
@@ -79,7 +93,7 @@ export function writeGithubEnv(rt, values) {
   appendFileSync(file, out);
 }
 
-/** Clean up so one slot cannot leave anything behind for the next. */
+/** Clean up so one slot cannot leave anything behind for the next. Also removes the origin URL the action sets for a push. */
 export function cleanBetweenSlots(rt) {
   removeFile(rt.execFile);
   removeFile(rt.inlineBuffer);
@@ -135,6 +149,8 @@ export function readSlotResult(rt, pending, seenSessions) {
   if (pending.max_turns > 0 && Number.isFinite(result.num_turns) && result.num_turns > pending.max_turns) {
     return { ok: false, sessionId, error: `the agent reported ${result.num_turns} turns, over the limit of ${pending.max_turns}` };
   }
+  // The push slot has no schema: whether it worked is decided by the branch on GitHub, not by its answer.
+  if (pending.role === 'push') return { ok: true, output: null, sessionId };
   const out = result.structured_output;
   if (!out || typeof out !== 'object') return { ok: false, sessionId, error: 'the agent returned no structured output' };
   return { ok: true, output: out, sessionId };

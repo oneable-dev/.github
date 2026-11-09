@@ -15,9 +15,19 @@
 import { join } from 'node:path';
 import { readJson, writeJsonAtomic } from './util.mjs';
 
-export const MAX_SLOTS = 45;
+/** Agent slots per run. The workflow YAML repeats its step/agent pair this many times. */
+export const MAX_SLOTS = 60;
+/** Job time that must be left to start a review slot. */
 export const MIN_SECONDS_FOR_AGENT = 25 * 60;
+/** Job time that must be left to start a fix slot: the fix (up to 20 minutes) plus the push that follows it. */
+export const MIN_SECONDS_FOR_FIX = 35 * 60;
+/** Job time that must be left to start a push slot (which has a 5 minute timeout). */
+export const MIN_SECONDS_FOR_PUSH = 10 * 60;
+export const PUSH_STEP_TIMEOUT_MINUTES = 5;
+export const DEFAULT_AGENT_STEP_TIMEOUT_MINUTES = 20;
 export const L0_COMMAND_SECONDS = 15 * 60;
+/** Why a fix commit was left unpushed when no push slot could be started. */
+export const NO_PUSH_ROOM = 'not enough job time or agent steps left to push';
 
 const num = (v, d) => {
   if (v === undefined || v === '') return d;
@@ -47,6 +57,8 @@ export function readConfig(env) {
     fix_max_turns: num(raw('FIX_MAX_TURNS'), 40),
     max_fix_rounds: num(raw('MAX_FIX_ROUNDS'), 3),
     timeout_minutes: num(raw('TIMEOUT_MINUTES'), 60),
+    // Never 0: the workflow reads CLR_STEP_TIMEOUT through fromJSON, and '0' would fall back to the input.
+    agent_step_timeout_minutes: num(raw('AGENT_STEP_TIMEOUT_MINUTES'), DEFAULT_AGENT_STEP_TIMEOUT_MINUTES) || DEFAULT_AGENT_STEP_TIMEOUT_MINUTES,
     extra_prompt: raw('EXTRA_PROMPT'),
     allowed_bots: raw('ALLOWED_BOTS', '*'),
     setup_command: raw('SETUP_COMMAND').trim(),

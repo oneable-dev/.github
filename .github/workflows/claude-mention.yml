@@ -11,12 +11,27 @@ name: Claude Mention
 # - The caller workflow must live on the default branch. `issue_comment` and `issues`
 #   events only run workflow files from the default branch, so a caller added in a PR
 #   does nothing until it is merged.
-# - The caller must grant at least `contents: write`, `pull-requests: write` and
-#   `issues: write`; a called workflow can never exceed the caller's permissions.
+# - The caller must grant `contents: read`, `pull-requests: write`, `issues: write` and
+#   `id-token: write`; a called workflow can never exceed the caller's permissions.
+#   `id-token: write` lets the action exchange the OIDC token for a Claude GitHub App
+#   token, so the Claude GitHub App must be installed on the repository.
+# - Commits and pushes are made by `claude[bot]` with the App token, not with GITHUB_TOKEN.
+#   Claude Review skips runs triggered by `claude[bot]` in its job `if`, so Claude's own
+#   pushes do not start a review loop.
+# - The App installation has `workflows: write`, so GitHub can accept pushes to
+#   `.github/workflows/**` (the scope of the issued token is not verified).
+#   Protection of `.github/**` and CODEOWNERS is done by a PreToolUse hook
+#   (.github/claude-review/hooks/pretooluse.mjs, fetched from this workflow's own
+#   commit). Its settings set `disableAllHooks: false`, so a repository
+#   `.claude/settings.json` cannot switch the hook off. A self-check step fails the job
+#   if the hook does not deny a forbidden call (fail closed). With
+#   `allow_code_changes: false` the hook runs in read-only mode.
+# - The App only issues a token for workflow files that match the default branch. A pull
+#   request that changes the caller workflow therefore gets no token for its
+#   `pull_request_review*` events (mention there fails); `issue_comment` events use the
+#   default branch's file and keep working.
 # - Running this together with Claude Review on the same PR can make one of two
 #   concurrent pushes to the PR branch fail (non-fast-forward). Re-mention Claude to retry.
-# - Pushes that touch `.github/workflows/**` are rejected by GitHub for the default
-#   GITHUB_TOKEN. The instructions below also tell Claude not to modify those paths.
 
 on:
   workflow_call:
@@ -98,11 +113,14 @@ jobs:
     concurrency:
       group: claude-mention-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: false
-    # No id-token: the action skips the OIDC app-token exchange when github_token is passed.
+    # contents: read is enough for this job's own steps. Commits and pushes are made with the
+    # Claude GitHub App token. id-token: write lets the action exchange the OIDC token for
+    # that app token (no github_token input).
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
       issues: write
+      id-token: write
     steps:
       # Fork PRs are skipped (requirement: Claude Mention does not run on pull requests from
       # forks). For a PR the action restores its protected config paths (`.claude`,
@@ -196,21 +214,91 @@ jobs:
             } >> "$INSTRUCTIONS_FILE"
           fi
 
+      # Get the PreToolUse hook from the commit of this workflow file, so a caller pinned to a
+      # tag or SHA gets the matching hook. Runs outside the workspace, so the pull request
+      # cannot replace it. `node` is resolved now, before any repository command runs, and
+      # used by its absolute path.
+      - name: Fetch PreToolUse hook
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          SRC_REPO: ${{ job.workflow_repository }}
+          SRC_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SRC_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo "::error::Unexpected workflow repository: $SRC_REPO"; exit 1; }
+          [[ "$SRC_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Unexpected workflow commit: $SRC_SHA"; exit 1; }
+          src="$RUNNER_TEMP/claude-review-src"
+          rm -rf "$src"
+          mkdir -p "$src"
+          git -C "$src" init -q
+          git -C "$src" fetch -q --depth=1 --no-tags "$GITHUB_SERVER_URL/$SRC_REPO.git" "$SRC_SHA" \
+            || { echo "::error::Could not fetch $SRC_REPO@$SRC_SHA. The repository that holds this workflow must be readable without a token."; exit 1; }
+          git -C "$src" checkout -q --detach FETCH_HEAD
+          got=$(git -C "$src" rev-parse HEAD)
+          [ "$got" = "$SRC_SHA" ] || { echo "::error::Fetched $got, expected $SRC_SHA"; exit 1; }
+          test -f "$src/.github/claude-review/hooks/pretooluse.mjs"
+          node_bin=$(command -v node)
+          {
+            echo "CLR_SRC=$src"
+            echo "CLR_NODE=$node_bin"
+          } >> "$GITHUB_ENV"
+          echo "Hook from $SRC_REPO@$SRC_SHA"
+
+      # Write the Claude settings file that wires the hook into every tool call, then check
+      # that the hook really denies. The hook command line and the claude_args both embed
+      # these paths, so paths with whitespace, quotes, `$`, backticks or backslashes are
+      # rejected. `disableAllHooks: false` is required: a repository `.claude/settings.json`
+      # that sets it to true would otherwise switch the hook off. Fails closed: if the hook
+      # does not deny the test call, the job fails and Claude does not run.
+      - name: Configure and check PreToolUse hook
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          ALLOW_CODE_CHANGES: ${{ inputs.allow_code_changes }}
+          HOOK_DIR: ${{ runner.temp }}/claude-mention-hooks
+        run: |
+          set -euo pipefail
+          if [ "$ALLOW_CODE_CHANGES" = "true" ]; then role=mention; else role=mention-ro; fi
+          hook="$CLR_SRC/.github/claude-review/hooks/pretooluse.mjs"
+          log="$HOOK_DIR/hook.jsonl"
+          settings="$HOOK_DIR/settings.json"
+          for p in "$CLR_NODE" "$hook" "$GITHUB_WORKSPACE" "$log" "$settings"; do
+            case "$p" in
+              *[[:space:]\"\'\$\`\\]*) echo "::error::Path not allowed in a hook command: $p"; exit 1 ;;
+            esac
+          done
+          mkdir -p "$HOOK_DIR"
+          # The empty input directory is passed as an empty argument ('').
+          command="$CLR_NODE $hook $role $GITHUB_WORKSPACE '' $log"
+          jq -n --arg command "$command" '{
+            disableAllHooks: false,
+            hooks: { PreToolUse: [ { matcher: "*", hooks: [ { type: "command", command: $command } ] } ] }
+          }' > "$settings"
+          # Self-check with a call the hook must deny in both roles.
+          out=$(printf '%s' '{"tool_name":"Write","tool_input":{"file_path":".github/workflows/x.yml","content":"x"}}' \
+            | env -i PATH="$PATH" "$CLR_NODE" "$hook" "$role" "$GITHUB_WORKSPACE" '' "$HOOK_DIR/self-test.jsonl" || true)
+          rm -f "$HOOK_DIR/self-test.jsonl"
+          case "$out" in
+            *CLR_HOOK_DENY:*) echo "Hook role $role denies forbidden calls." ;;
+            *) echo "::error::The $role hook did not deny a forbidden call; refusing to run Claude."; exit 1 ;;
+          esac
+
       # anthropics/claude-code-action v1.0.269
-      # No `prompt` input (tag mode). No bots may trigger it (allowed_bots empty, which is
-      # the action default). The action also requires the actor to have write access.
+      # No `prompt` input (tag mode). No `github_token` input: the action exchanges the OIDC
+      # token for a Claude GitHub App token. No bots may trigger it (allowed_bots empty,
+      # which is the action default). The action also requires the actor to have write
+      # access. The PreToolUse hook is loaded through --settings.
       - name: Run Claude
         if: steps.gate.outputs.skip != 'true'
         uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ github.token }}
           allowed_bots: ""
           trigger_phrase: ${{ inputs.trigger_phrase }}
           # With allow_code_changes false, the git tools and file edit tools are denied.
           # The action's push wrapper is scripts/git-push.sh inside the action checkout,
           # hence the path pattern next to `git push`.
           claude_args: |
+            --settings ${{ runner.temp }}/claude-mention-hooks/settings.json
             --append-system-prompt-file ${{ runner.temp }}/claude-mention-instructions.md
             --max-turns ${{ inputs.max_turns }}
             ${{ inputs.model != '' && format('--model {0}', inputs.model) || '' }}

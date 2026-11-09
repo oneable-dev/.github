@@ -12,21 +12,25 @@ import {
   appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { init, main, report, step } from './driver.mjs';
 import { buildArgs, readSlotResult, renderPrompt, slotMaxTurns, writeGithubEnv } from './lib/agent.mjs';
+import { hookScript, selfTestHooks, settingsPath } from './lib/hooks.mjs';
 import { applyFix, applyPolicy, applyReview } from './lib/findings.mjs';
 import { RESTORE_PATHS, commitAll } from './lib/gitops.mjs';
 import { decide } from './lib/plan.mjs';
 import { fingerprint } from './lib/report.mjs';
 import { REPORT_HEADER, decodeStateMarker, encodeStateMarker, isDriverReport, lastMarkers, resolveScope } from './lib/scope.mjs';
-import { emptyL0, emptyLayer, loadState, readConfig } from './lib/state.mjs';
+import {
+  MAX_SLOTS, MIN_SECONDS_FOR_FIX, MIN_SECONDS_FOR_PUSH, NO_PUSH_ROOM, emptyL0, emptyLayer, loadState, readConfig, saveState,
+} from './lib/state.mjs';
 import { SYSTEM_PATH, createRuntime, runShell, sanitizedEnv, sanitizeText, systemBinary } from './lib/util.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(HERE, 'fixtures');
 const BOT = 'github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>';
+const WORKFLOW = join(HERE, '..', 'workflows', 'claude-review.yml');
 
 // ---------------------------------------------------------------------------------------------------
 // Helpers
@@ -171,7 +175,23 @@ function writeExec(w, res) {
   writeFileSync(w.rt.execFile, JSON.stringify(messages));
 }
 
-/** Run step/agent pairs until the loop says done. `respond` plays the agent. */
+/** An execution file without structured output, the way a push slot (no --json-schema) leaves it. */
+function pushExec() {
+  const sid = `push-${++sessionCounter}-${Math.random().toString(16).slice(2)}`;
+  return { raw: [{ type: 'system', subtype: 'init', session_id: sid }, { type: 'result', subtype: 'success', is_error: false, session_id: sid, num_turns: 2 }] };
+}
+
+/** Play the push slot: run `git push origin HEAD` in the work directory, as the agent would. A rejection is fine. */
+function playPush(w) {
+  try { git(w.work, 'push', 'origin', 'HEAD'); } catch { /* the branch moved: the driver must notice from the remote */ }
+  return pushExec();
+}
+
+/**
+ * Run step/agent pairs until the loop says done. `respond` plays the review and fix agents.
+ * Push slots run `git push origin HEAD` unless the world has its own `push(info, w)` (return undefined for
+ * "the action wrote nothing").
+ */
 async function drive(w, respond, max = 70) {
   const slots = [];
   for (let i = 0; i < max; i++) {
@@ -181,9 +201,10 @@ async function drive(w, respond, max = 70) {
     if (env.CLR_NEXT === 'done') return slots;
     assert.equal(env.CLR_NEXT, 'agent');
     const pending = loadState(w.rt).pending;
-    const info = { role: pending.role, layer: pending.layer, round: pending.round, env };
+    const info = { role: pending.role, layer: pending.layer, round: pending.round, env, pending };
     slots.push(info);
-    writeExec(w, await respond(info, w));
+    if (info.role === 'push') writeExec(w, await (w.push ? w.push(info, w) : playPush(w)));
+    else writeExec(w, await respond(info, w));
   }
   throw new Error('the loop did not finish');
 }
@@ -230,6 +251,10 @@ test('readConfig: defaults apply when unset, empty effort turns the flag off, la
   assert.equal(d.fix_model, 'claude-sonnet-5-5');
   assert.equal(d.fix_effort, 'medium');
   assert.equal(d.max_fix_rounds, 3);
+  assert.equal(d.agent_step_timeout_minutes, 20);
+  assert.equal(readConfig({ CLR_INPUT_AGENT_STEP_TIMEOUT_MINUTES: '12' }).agent_step_timeout_minutes, 12);
+  assert.equal(readConfig({ CLR_INPUT_AGENT_STEP_TIMEOUT_MINUTES: '0' }).agent_step_timeout_minutes, 20, 'never 0: fromJSON(0) is falsy in the workflow');
+  assert.equal(readConfig({ CLR_INPUT_AGENT_STEP_TIMEOUT_MINUTES: '' }).agent_step_timeout_minutes, 20);
   assert.equal(d.models.L2, 'claude-opus-5-5');
   const c = readConfig({
     CLR_INPUT_REVIEW_EFFORT: '', CLR_INPUT_L2_MODEL: 'claude-sonnet-5-5', CLR_INPUT_CHECK_COMMANDS: 'pnpm lint\n\n# comment\n pnpm test \n',
@@ -257,6 +282,15 @@ test('buildArgs: reviewers are read-only, fix agents can edit but have no shell,
   assert.doesNotMatch(unsafe, /--model/);
 });
 
+test('buildArgs: --settings goes last, and the push slot is haiku with one Bash command and no schema or input directory', () => {
+  const cfg = readConfig({});
+  assert.match(buildArgs(cfg, { role: 'review', layer: 'L1', inDir: '/tmp/in', settings: '/tmp/s/settings-review.json' }), / --add-dir \/tmp\/in --settings \/tmp\/s\/settings-review\.json$/);
+  assert.match(buildArgs(cfg, { role: 'fix', layer: 'L2', inDir: '/tmp/in', settings: '/tmp/s/settings-fix.json' }), / --settings \/tmp\/s\/settings-fix\.json$/);
+  const push = buildArgs(cfg, { role: 'push', settings: '/tmp/s/settings-push.json' });
+  assert.equal(push, '--model haiku --max-turns 2 --allowedTools "Bash(git push origin HEAD)" --settings /tmp/s/settings-push.json');
+  assert.doesNotMatch(push, /json-schema|add-dir|Edit|Write/);
+});
+
 test('prompts: every template renders, holds only trusted text, and rejects unknown placeholders', () => {
   const vars = { IN_DIR: '/tmp/in', LAYER: 'L1', ROUND: '2', EXTRA: '' };
   for (const [name, layer] of [['review-l1', 'L1'], ['review-l2', 'L2'], ['review-l3', 'L3'], ['fix', 'L2'], ['fix-l0', 'L0']]) {
@@ -267,6 +301,13 @@ test('prompts: every template renders, holds only trusted text, and rejects unkn
   assert.match(renderPrompt('review-l3', vars), /AGENTS\.md:42/);
   assert.match(renderPrompt('review-l1', { ...vars, EXTRA: '## Additional repository-specific instructions\n\nBe terse.' }), /Be terse\./);
   assert.throws(() => renderPrompt('review-l1', { IN_DIR: 'x' }), /unknown placeholder/);
+});
+
+test('prompts: the push prompt is fixed trusted text that names the one command', () => {
+  const text = renderPrompt('push', {});
+  assert.match(text, /git push origin HEAD/);
+  assert.doesNotMatch(text, /\{\{/);
+  assert.match(renderPrompt('fix', { IN_DIR: '/tmp/in', LAYER: 'L2', ROUND: '1', EXTRA: '' }), /cannot run tests, commit or push/);
 });
 
 test('writeGithubEnv: heredoc entries with a delimiter that is not in the value', () => {
@@ -542,16 +583,52 @@ test('decide: a layer whose review failed twice is skipped, not retried again an
 
 test('decide: slot budget and time budget', () => {
   const now = Date.now();
-  const s = blankState({ slots_used: 42 });
+  const s = blankState({ slots_used: MAX_SLOTS - 4 });
   s.layers.L1.reviewed_head = 'h1';
   s.layers.L1.findings.push(finding({ id: 'L1-1', layer: 'L1' }));
-  assert.deepEqual(decide(s, now), { type: 'review', layer: 'L2' }, 'fewer than 4 slots left: no fix, still review');
+  assert.deepEqual(decide(s, now), { type: 'review', layer: 'L2' }, 'fewer than 5 slots left (fix, push, 3 reviews): no fix, still review');
   assert.equal(s.fixes_disabled, 'slots');
-  assert.deepEqual(decide(blankState({ slots_used: 45 }), now), { type: 'done', reason: 'slots' });
+  const five = blankState({ slots_used: MAX_SLOTS - 5 });
+  five.layers.L1.reviewed_head = 'h1';
+  five.layers.L1.findings.push(finding({ id: 'L1-1', layer: 'L1' }));
+  assert.deepEqual(decide(five, now), { type: 'fix', layer: 'L1' }, 'exactly 5 slots is enough');
+  assert.deepEqual(decide(blankState({ slots_used: MAX_SLOTS }), now), { type: 'done', reason: 'slots' });
   const late = blankState({ started_at: now / 1000 - 40 * 60, timeout_minutes: 60 });
   assert.deepEqual(decide(late, now), { type: 'done', reason: 'time' }, 'under 25 minutes left: no new agent');
   const fine = blankState({ started_at: now / 1000 - 30 * 60, timeout_minutes: 60 });
   assert.equal(decide(fine, now).type, 'review');
+  // 30 minutes left: enough for a review, not for a fix (35 minutes: the fix, then the push).
+  const short = blankState({ started_at: now / 1000 - 30 * 60, timeout_minutes: 60 });
+  short.layers.L1.reviewed_head = 'h1';
+  short.layers.L1.findings.push(finding({ id: 'L1-1', layer: 'L1' }));
+  assert.deepEqual(decide(short, now), { type: 'review', layer: 'L2' });
+  assert.equal(short.fixes_disabled, 'time');
+  const enough = blankState({ started_at: now / 1000 - (60 * 60 - MIN_SECONDS_FOR_FIX - 5), timeout_minutes: 60 });
+  enough.layers.L1.reviewed_head = 'h1';
+  enough.layers.L1.findings.push(finding({ id: 'L1-1', layer: 'L1' }));
+  assert.deepEqual(decide(enough, now), { type: 'fix', layer: 'L1' });
+});
+
+test('decide: a pending push comes before everything else, and without room it stops the run', () => {
+  const now = Date.now();
+  const pending = { sha: 'abc', layer: 'L2', round: 1, kind: 'fix' };
+  const s = blankState({ push_pending: pending, l0: { ...emptyL0(), status: 'fail', ran_head: 'old' } });
+  assert.deepEqual(decide(s, now), { type: 'push' }, 'before L0 and before any review');
+  s.slots_used = MAX_SLOTS;
+  assert.deepEqual(decide(s, now), { type: 'done', reason: 'push' });
+  assert.deepEqual(s.stop, { reason: 'push', detail: NO_PUSH_ROOM });
+  // Time: the push slot needs MIN_SECONDS_FOR_PUSH (10 minutes) left.
+  const t = blankState({ push_pending: pending, started_at: now / 1000 - (60 * 60 - MIN_SECONDS_FOR_PUSH - 5), timeout_minutes: 60 });
+  assert.deepEqual(decide(t, now), { type: 'push' });
+  const u = blankState({ push_pending: pending, started_at: now / 1000 - (60 * 60 - MIN_SECONDS_FOR_PUSH + 5), timeout_minutes: 60 });
+  assert.deepEqual(decide(u, now), { type: 'done', reason: 'push' });
+  assert.equal(u.stop.detail, NO_PUSH_ROOM);
+  // A stop that is already set wins.
+  const v = blankState({ push_pending: pending, stop: { reason: 'push', detail: 'x' } });
+  assert.deepEqual(decide(v, now), { type: 'done', reason: 'push' });
+  // The caller workflow changed: no agent, even when the L0 gate would allow reviews.
+  const k = blankState({ app_skip: { path: '.github/workflows/review.yml' } });
+  assert.deepEqual(decide(k, now), { type: 'done', reason: 'app-skip' });
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -576,6 +653,10 @@ test('e2e: a clean pull request gets three reviews and a summary that ends with 
     });
     assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'review:L3']);
     assert.match(slots[0].env.CLR_ARGS, /--model claude-opus-5-5 --effort high/);
+    for (const slot of slots) {
+      assert.equal(slot.env.CLR_STEP_TIMEOUT, '20', 'review slots use agent_step_timeout_minutes');
+      assert.match(slot.env.CLR_ARGS, new RegExp(` --settings ${settingsPath(w.rt, 'review').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`));
+    }
     assert.doesNotMatch(slots[0].env.CLR_PROMPT, /Input is validated|Adds validation/, 'no pull request text in the prompt');
 
     await report(w.rt);
@@ -595,6 +676,12 @@ test('e2e: a blocking finding is fixed, committed as the bot, pushed, and every 
     await init(w.rt);
     write(w.work, 'build.log', 'artifact from an earlier check\n'); // untracked before the fix: must not be committed
     const seen = {};
+    const pushes = [];
+    w.push = (info) => {
+      // Until the push slot has run, the fix commit exists only in the checkout.
+      pushes.push({ args: info.env.CLR_ARGS, timeout: info.env.CLR_STEP_TIMEOUT, prompt: info.env.CLR_PROMPT, remote: git(w.origin, 'rev-parse', 'refs/heads/feature'), state: loadState(w.rt) });
+      return playPush(w);
+    };
     const slots = await drive(w, (info) => {
       if (info.role === 'review') {
         seen[`${info.layer}:${info.round}`] = inFile(w, 'scope.json');
@@ -612,8 +699,16 @@ test('e2e: a blocking finding is fixed, committed as the bot, pushed, and every 
       write(w.work, '.github/workflows/ci.yml', 'name: pwned\n');
       return { output: { addressed: ['L2-1'], not_addressed: [] } };
     });
-    assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'fix:L2', 'review:L1', 'review:L2', 'review:L3']);
+    assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'fix:L2', 'push:L2', 'review:L1', 'review:L2', 'review:L3']);
     assert.equal(slots[2].env.CLR_ARGS.includes('acceptEdits'), true);
+    assert.equal(slots[2].env.CLR_STEP_TIMEOUT, '20');
+    assert.equal(slots[3].env.CLR_STEP_TIMEOUT, '5', 'the push slot has a 5 minute timeout');
+    assert.match(slots[3].env.CLR_ARGS, /^--model haiku --max-turns 2 --allowedTools "Bash\(git push origin HEAD\)" --settings .*settings-push\.json$/);
+    assert.match(slots[3].env.CLR_PROMPT, /git push origin HEAD/);
+    assert.equal(pushes.length, 1);
+    assert.equal(pushes[0].remote, w.head, 'the driver did not push: the remote was untouched when the push slot started');
+    assert.deepEqual(pushes[0].state.push_pending, { sha: pushes[0].state.head, layer: 'L2', round: 1, kind: 'fix' });
+    assert.equal(pushes[0].state.pushed_head, w.head);
     assert.equal(seen['L1:2'].mode, 'incremental');
     assert.equal(seen['L1:2'].from_sha, w.head);
     assert.equal(seen['L3:1'].mode, 'full', 'L3 had never run');
@@ -627,6 +722,9 @@ test('e2e: a blocking finding is fixed, committed as the bot, pushed, and every 
     assert.deepEqual(git(w.work, 'show', '--name-only', '--format=', sha).split('\n').sort(), ['src/app.js', 'src/extra.js']);
     assert.equal(git(w.origin, 'rev-parse', 'refs/heads/feature'), sha, 'pushed without force');
     assert.equal(state.pushed_head, sha);
+    assert.equal(state.push_pending, null, 'cleared once the remote head matched');
+    assert.equal(state.commits[0].pushed, true);
+    assert.equal(state.slots_used, 7);
     assert.equal(readText(join(w.work, '.github/workflows/ci.yml')), 'name: ci\n', 'workflow edits are reverted');
     assert.equal(readText(join(w.work, '.claude/settings.json')), '{"base":true}\n', 'protected files come from the base branch');
     assert.equal(existsSync(join(w.work, '.claude/hooks/evil.sh')), false);
@@ -657,15 +755,15 @@ test('e2e: a fix limit of 3 per layer stops fixing, reviews the later layer once
     });
     assert.deepEqual(kinds(slots), [
       'review:L1', 'review:L2',
-      'fix:L2', 'review:L1', 'review:L2',
-      'fix:L2', 'review:L1', 'review:L2',
-      'fix:L2', 'review:L1', 'review:L2',
+      'fix:L2', 'push:L2', 'review:L1', 'review:L2',
+      'fix:L2', 'push:L2', 'review:L1', 'review:L2',
+      'fix:L2', 'push:L2', 'review:L1', 'review:L2',
       'review:L3',
     ]);
     const state = loadState(w.rt);
     assert.equal(state.layers.L2.fixes, 3);
     assert.equal(state.layers.L2.capped, true);
-    assert.equal(state.slots_used, 12);
+    assert.equal(state.slots_used, 15);
     assert.equal(state.commits.length, 3);
 
     await report(w.rt);
@@ -895,18 +993,107 @@ test('e2e: a rejected push stops the loop, keeps the remote history, and the mar
       }
       return info.layer === 'L2' ? review('L2', [blocking()]) : review(info.layer);
     });
-    assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'fix:L2']);
+    assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'fix:L2', 'push:L2']);
     const state = loadState(w.rt);
     assert.equal(state.stop.reason, 'push');
+    assert.match(state.stop.detail, /feature on GitHub is at [0-9a-f]{7}, not at the fix commit [0-9a-f]{7}/);
     assert.equal(state.pushed_head, w.head);
+    assert.ok(state.push_pending, 'the commit is still waiting: it is not on the branch');
+    assert.equal(state.commits[0].pushed, false);
     assert.equal(git(w.origin, 'rev-parse', 'refs/heads/feature'), competitor, 'history was not overwritten');
 
     await report(w.rt);
     const body = w.summaries[0];
-    assert.match(body, /Pushing the fix commits was rejected/);
-    assert.match(body, /pushing the fix commits was rejected/);
+    assert.match(body, /The push slot did not put the fix commit on the branch/);
+    assert.match(body, /a fix commit could not be pushed/);
+    assert.match(body, /\(not pushed\)/, 'the commit list shows the unpushed commit');
+    assert.match(body, /the run stopped after a push slot failed/);
     assert.equal(lastLine(body), `<!-- claude-review:head=${w.baseSha} -->`, 'L3 never ran, so the marker stays at the last complete review');
     assert.doesNotMatch(body, new RegExp(state.head.slice(0, 40) + ' -->'), 'the marker never names an unpushed commit');
+  });
+});
+
+test('e2e: a push slot that wrote nothing, or whose hook denied the command, stops the run and says why', async () => {
+  const fixAgent = (w) => (info) => {
+    if (info.role === 'fix') { appendFileSync(join(w.work, 'src/app.js'), '// fix\n'); return { output: { addressed: ['L2-1'], not_addressed: [] } }; }
+    return info.layer === 'L2' ? review('L2', [blocking()]) : review(info.layer);
+  };
+  await withWorld({}, async (w) => {
+    await init(w.rt);
+    w.push = () => undefined; // the action skipped: no execution file, nothing pushed
+    const slots = await drive(w, fixAgent(w));
+    assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'fix:L2', 'push:L2']);
+    const state = loadState(w.rt);
+    assert.equal(state.stop.reason, 'push');
+    assert.match(state.stop.detail, /the push slot failed: no execution file was written/);
+    assert.equal(git(w.origin, 'rev-parse', 'refs/heads/feature'), w.head);
+    assert.equal(state.notes.some((n) => /first agent slot wrote no execution file/.test(n)), false, 'only the very first slot gets that note');
+  });
+  await withWorld({}, async (w) => {
+    await init(w.rt);
+    w.push = (info) => {
+      // The hook said no (the model tried something else), and nothing was pushed.
+      writeFileSync(info.pending.hook_log, `${JSON.stringify({ ts: 'x', tool_name: 'Bash', target: 'git push --force', decision: 'deny', rule: 'push-only' })}\n`);
+      return pushExec();
+    };
+    await drive(w, fixAgent(w));
+    const detail = loadState(w.rt).stop.detail;
+    assert.match(detail, /hook log: 1 of 1 tool call\(s\) denied \(push-only x1\)/);
+    await report(w.rt);
+    assert.match(w.summaries[0], /The push slot did not put the fix commit on the branch/);
+  });
+});
+
+test('e2e: without room for a push slot the fix commit stays local and the run stops with that reason', async () => {
+  await withWorld({ assignee: 'maintainer' }, async (w) => {
+    await init(w.rt);
+    const slots = await drive(w, (info) => {
+      if (info.role === 'fix') {
+        appendFileSync(join(w.work, 'src/app.js'), '// fix\n');
+        // The agent steps run out while the fix slot runs.
+        const st = loadState(w.rt);
+        st.slots_used = MAX_SLOTS;
+        saveState(w.rt, st);
+        return { output: { addressed: ['L2-1'], not_addressed: [] } };
+      }
+      return info.layer === 'L2' ? review('L2', [blocking()]) : review(info.layer);
+    });
+    assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'fix:L2'], 'no push slot was started');
+    const state = loadState(w.rt);
+    assert.deepEqual(state.stop, { reason: 'push', detail: NO_PUSH_ROOM });
+    assert.equal(state.done_reason, 'push');
+    assert.equal(git(w.origin, 'rev-parse', 'refs/heads/feature'), w.head);
+    await report(w.rt);
+    const body = w.summaries[0];
+    assert.match(body, /A fix commit was made but not pushed: not enough job time or agent steps left to push/);
+    assert.match(body, /there was no room left to push a fix commit/);
+    assert.doesNotMatch(body, /the push slot failed/i);
+    assert.match(body, /@maintainer this pull request needs a person/);
+  });
+});
+
+test('report collects a push slot that was still pending, and verifies the branch', async () => {
+  await withWorld({}, async (w) => {
+    await init(w.rt);
+    let guard = 0;
+    for (;;) {
+      if (guard++ > 20) throw new Error('no push slot appeared');
+      writeFileSync(w.env.GITHUB_ENV, '');
+      await step(w.rt);
+      const pending = loadState(w.rt).pending;
+      if (!pending) throw new Error('the loop ended without a push slot');
+      if (pending.role === 'push') break;
+      if (pending.role === 'fix') {
+        appendFileSync(join(w.work, 'src/app.js'), '// fix\n');
+        writeExec(w, { output: { addressed: ['L2-1'], not_addressed: [] } });
+      } else writeExec(w, pending.layer === 'L2' ? review('L2', [blocking()]) : review(pending.layer));
+    }
+    writeExec(w, playPush(w));
+    await report(w.rt); // the workflow's last agent step is a push: no step call follows it
+    const state = loadState(w.rt);
+    assert.equal(state.pushed_head, git(w.origin, 'rev-parse', 'refs/heads/feature'));
+    assert.equal(state.commits[0].pushed, true);
+    assert.doesNotMatch(w.summaries[0], /not pushed/);
   });
 });
 
@@ -949,11 +1136,15 @@ test('e2e L0: fix_command runs first, its changes are committed as the bot, and 
     await init(w.rt);
     write(w.work, 'tool-cache.tmp', 'left by an earlier command\n');
     const slots = await drive(w, cleanReviewer);
-    assert.deepEqual(kinds(slots), ['review:L1', 'review:L2', 'review:L3'], 'no agent was needed for L0');
+    assert.deepEqual(kinds(slots), ['push:L0', 'review:L1', 'review:L2', 'review:L3'], 'no fix agent was needed for L0, but the commit needs the push slot');
     const state = loadState(w.rt);
     assert.equal(state.l0.status, 'pass');
     assert.equal(state.l0.autofix_runs, 1);
     assert.notEqual(state.head, w.head);
+    assert.deepEqual(state.l0.history.filter((h) => h.kind === 'run').map((h) => h.head), [w.head, state.head], 'the checks ran again at the pushed head');
+    assert.equal(state.l0.history.find((h) => h.kind === 'autofix').pushed, true);
+    assert.equal(state.push_pending, null);
+    assert.equal(slots[0].env.CLR_STEP_TIMEOUT, '5');
     assert.equal(git(w.work, 'log', '-1', '--format=%an <%ae>|%s', state.head), `${BOT}|Apply automated fixes from the repository fix command`);
     assert.equal(git(w.work, 'show', '--name-only', '--format=', state.head), 'BAD');
     assert.equal(git(w.origin, 'rev-parse', 'refs/heads/feature'), state.head);
@@ -999,7 +1190,7 @@ test('e2e L0: failures go to the fix agent, three rounds at most, then the layer
       }
       return review(info.layer);
     });
-    assert.deepEqual(kinds(slots), ['fix:L0', 'fix:L0', 'fix:L0', 'review:L1', 'review:L2', 'review:L3']);
+    assert.deepEqual(kinds(slots), ['fix:L0', 'push:L0', 'fix:L0', 'push:L0', 'fix:L0', 'push:L0', 'review:L1', 'review:L2', 'review:L3']);
     const state = loadState(w.rt);
     assert.equal(state.l0.capped, true);
     assert.equal(state.l0.status, 'fail');
@@ -1024,6 +1215,236 @@ test('e2e L0: a command that runs past the limit fails the gate instead of hangi
     assert.equal(loadState(w.rt).l0.failures[0].timed_out, true);
     assert.equal(slots.filter((s) => s.role === 'fix').length, 3);
   });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// Push slot wiring: checkout, hook settings, timeouts, workflow validation
+// ---------------------------------------------------------------------------------------------------
+
+test('init: the checkout moves from a detached HEAD to the PR branch, and repository git hooks are switched off', async () => {
+  await withWorld({}, async (w) => {
+    assert.throws(() => git(w.work, 'symbolic-ref', '--short', 'HEAD'), 'the test harness starts detached, like actions/checkout');
+    await init(w.rt);
+    assert.equal(git(w.work, 'symbolic-ref', '--short', 'HEAD'), 'feature');
+    assert.equal(git(w.work, 'rev-parse', 'HEAD'), w.head);
+    assert.equal(git(w.work, 'config', '--local', 'core.hooksPath'), '/dev/null');
+    assert.equal(loadState(w.rt).fixes_disabled, null);
+  });
+  await withWorld({}, async (w) => {
+    const event = JSON.parse(readText(w.env.GITHUB_EVENT_PATH));
+    event.pull_request.head.ref = '--bad ref';
+    writeFileSync(w.env.GITHUB_EVENT_PATH, JSON.stringify(event));
+    await init(w.rt);
+    const state = loadState(w.rt);
+    assert.equal(state.fixes_disabled, 'branch', 'a branch the push slot cannot name gets no fixes');
+    assert.ok(state.notes.some((n) => /not valid for pushing/.test(n)));
+    assert.equal(git(w.work, 'config', '--local', 'core.hooksPath'), '/dev/null', 'hooks are off even then');
+  });
+});
+
+test('hook settings: one file per role with disableAllHooks false and absolute paths, and the command really denies', async () => {
+  await withWorld({ action: 'opened' }, async (w) => {
+    await init(w.rt);
+    writeFileSync(w.env.GITHUB_ENV, '');
+    await step(w.rt);
+    const env = parseEnv(readText(w.env.GITHUB_ENV));
+    const pending = loadState(w.rt).pending;
+    const file = settingsPath(w.rt, 'review');
+    assert.ok(file.endsWith('/claude-review-hooks/settings-review.json'));
+    assert.ok(env.CLR_ARGS.endsWith(` --settings ${file}`));
+    const settings = JSON.parse(readText(file));
+    assert.equal(settings.disableAllHooks, false, 'a project settings file with disableAllHooks:true must not switch the hook off');
+    assert.equal(settings.hooks.PreToolUse.length, 1);
+    assert.equal(settings.hooks.PreToolUse[0].matcher, '*');
+    const [entry] = settings.hooks.PreToolUse[0].hooks;
+    assert.equal(entry.type, 'command');
+    const [node, script, role, workspace, inDir, log] = entry.command.split(' ');
+    assert.equal(role, 'review');
+    assert.equal(script, hookScript());
+    assert.equal(workspace, w.work);
+    assert.equal(inDir, w.rt.inDir);
+    assert.equal(log, pending.hook_log);
+    for (const p of [node, script, workspace, inDir, log]) assert.ok(isAbsolute(p), `${p} is absolute`);
+    assert.equal(node, process.execPath, 'CLR_NODE is unset in the test, so the current node is used');
+    // Run the exact command the way Claude Code would: through a shell, hook JSON on stdin.
+    const out = execFileSync('sh', ['-c', entry.command], { input: JSON.stringify({ tool_name: 'Write', tool_input: { file_path: 'x.txt' } }), encoding: 'utf8' });
+    assert.match(out, /CLR_HOOK_DENY:tool-not-allowed/);
+    const row = JSON.parse(readText(log).trim());
+    assert.deepEqual([row.tool_name, row.decision, row.rule], ['Write', 'deny', 'tool-not-allowed']);
+  });
+});
+
+test('hook settings: the push settings pass the empty input directory as an empty argument; unsafe paths are refused', async () => {
+  const { hookCommand, writeSlotSettings } = await import('./lib/hooks.mjs');
+  const rt = { temp: '/tmp/runner', cwd: '/work/space', env: { CLR_NODE: '/opt/node/bin/node' }, inDir: '/tmp/runner/in' };
+  assert.equal(hookCommand(rt, 'push', '', '/tmp/runner/h.jsonl').split(' ').slice(2).join(' '), `push /work/space '' /tmp/runner/h.jsonl`);
+  assert.ok(hookCommand(rt, 'fix', rt.inDir, '/tmp/runner/h.jsonl').startsWith('/opt/node/bin/node '));
+  for (const bad of ['/tmp/a b', '/tmp/a"b', "/tmp/a'b", '/tmp/a$b', '/tmp/a`b', '/tmp/a\\b']) {
+    assert.throws(() => hookCommand({ ...rt, cwd: bad }, 'fix', rt.inDir, '/tmp/l'), /not allowed in a hook command/, bad);
+    assert.throws(() => hookCommand({ ...rt, env: { CLR_NODE: bad } }, 'fix', rt.inDir, '/tmp/l'), /not allowed/, bad);
+    assert.throws(() => writeSlotSettings({ ...rt, temp: bad }, 'review', { inDir: rt.inDir, logPath: '/tmp/l' }), /not allowed/, bad);
+  }
+});
+
+test('init: a hook that does not deny is fatal, the run ends before any agent starts, and the report says so', async () => {
+  await withWorld({ assignee: 'maintainer' }, async (w) => {
+    // A "node" that exits 0 and prints nothing: the hook would silently allow everything.
+    const fake = join(w.tmp, 'fake-node');
+    writeFileSync(fake, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    w.rt.env.CLR_NODE = fake;
+    assert.match(selfTestHooks(w.rt), /the review hook did not deny a forbidden call/);
+    await init(w.rt);
+    const state = loadState(w.rt);
+    assert.match(state.fatal, /^hook self-check failed: the review hook did not deny/);
+    assert.equal(state.finished, true);
+    assert.equal(state.done_reason, 'error');
+    writeFileSync(w.env.GITHUB_ENV, '');
+    await step(w.rt);
+    const env = parseEnv(readText(w.env.GITHUB_ENV));
+    assert.equal(env.CLR_NEXT, 'done');
+    assert.equal(env.CLR_STEP_TIMEOUT, '', 'done leaves no timeout behind');
+    await report(w.rt);
+    assert.match(w.summaries[0], /The driver stopped on an error: hook self-check failed/);
+    assert.match(w.summaries[0], /@maintainer/);
+  });
+  await withWorld({}, async (w) => {
+    assert.equal(selfTestHooks(w.rt), '', 'the real hook denies for every role');
+  });
+});
+
+test('slot timeouts: review and fix use agent_step_timeout_minutes, push uses 5', async () => {
+  await withWorld({ env: { CLR_INPUT_AGENT_STEP_TIMEOUT_MINUTES: '15' } }, async (w) => {
+    await init(w.rt);
+    const slots = await drive(w, (info) => {
+      if (info.role === 'fix') {
+        appendFileSync(join(w.work, 'src/app.js'), '// f\n');
+        return { output: { addressed: ['L2-1'], not_addressed: [] } };
+      }
+      return info.layer === 'L2' && info.round === 1 ? review('L2', [blocking()]) : review(info.layer, carry(w, info.layer, 'resolved'));
+    });
+    assert.deepEqual(slots.filter((s) => s.role === 'push').map((s) => s.env.CLR_STEP_TIMEOUT), ['5']);
+    const others = slots.filter((s) => s.role !== 'push');
+    assert.ok(others.length >= 4 && others.every((s) => s.env.CLR_STEP_TIMEOUT === '15'));
+  });
+});
+
+test('caller workflow changed: no agent slot runs, only L0 checks, the marker keeps the old base, and nobody is mentioned', async () => {
+  const ref = 'o/r/.github/workflows/caller.yml@refs/pull/7/merge';
+  await withWorld({
+    action: 'synchronize', assignee: 'maintainer', prFiles: { '.github/workflows/caller.yml': 'name: caller\n' },
+    env: { CLR_CALLER_WORKFLOW_REF: ref },
+  }, async (w) => {
+    w.botComments = [reportBody(w.baseSha)];
+    await init(w.rt);
+    const state0 = loadState(w.rt);
+    assert.deepEqual(state0.app_skip, { path: '.github/workflows/caller.yml' });
+    assert.equal(state0.fixes_disabled, 'app-skip');
+    assert.equal(state0.scope, 'incremental');
+    const slots = await drive(w, () => { throw new Error('no agent should run'); });
+    assert.deepEqual(slots, []);
+    assert.equal(loadState(w.rt).done_reason, 'app-skip');
+    assert.equal(loadState(w.rt).slots_used, 0);
+    await report(w.rt);
+    const body = w.summaries[0];
+    assert.match(body, /Claude review skipped: this pull request changes the caller workflow \.github\/workflows\/caller\.yml, so the Claude GitHub App does not issue a token until it matches the default branch\./);
+    assert.equal(lastLine(body), `<!-- claude-review:head=${w.baseSha} -->`, 'the marker keeps the previous base');
+    assert.doesNotMatch(body, /@maintainer/, 'a skipped review alone does not call for a person');
+    assert.doesNotMatch(body, /review incomplete|has no complete review/i);
+    assert.match(body, /Review skipped/);
+  });
+  // L0 still runs, but fix_command does not.
+  await withWorld({
+    action: 'opened', prFiles: { '.github/workflows/caller.yml': 'name: caller\n', BAD: 'x\n' },
+    env: { CLR_CALLER_WORKFLOW_REF: ref, CLR_INPUT_CHECK_COMMANDS: 'test ! -e BAD', CLR_INPUT_FIX_COMMAND: 'rm -f BAD' },
+  }, async (w) => {
+    await init(w.rt);
+    assert.deepEqual(await drive(w, () => { throw new Error('no agent should run'); }), []);
+    const state = loadState(w.rt);
+    assert.equal(state.l0.status, 'fail');
+    assert.equal(state.l0.autofix_runs, 0);
+    assert.equal(state.head, w.head);
+    assert.equal(existsSync(join(w.work, 'BAD')), true);
+  });
+  // Another repository's workflow, or a workflow this pull request does not touch: nothing is skipped.
+  for (const callerRef of ['other/r/.github/workflows/caller.yml@refs/heads/main', 'o/r/.github/workflows/untouched.yml@refs/heads/main', '']) {
+    await withWorld({ prFiles: { '.github/workflows/caller.yml': 'name: caller\n' }, env: { CLR_CALLER_WORKFLOW_REF: callerRef } }, async (w) => {
+      await init(w.rt);
+      assert.equal(loadState(w.rt).app_skip, null, callerRef);
+    });
+  }
+});
+
+test('the first agent slot that wrote no execution file gets a note about the action having skipped', async () => {
+  await withWorld({ action: 'opened' }, async (w) => {
+    await init(w.rt);
+    await drive(w, (info) => (info.layer === 'L1' ? undefined : review(info.layer)));
+    const notes = loadState(w.rt).notes.filter((n) => /the action may have skipped \(for example workflow validation\)/.test(n));
+    assert.equal(notes.length, 1, 'once, for slot 1 only (L1 is retried as slot 2 and gets no second note)');
+  });
+});
+
+test('e2e L0: fix_command runs at most once per call, and a new head after its push gets one more, three at most', async () => {
+  await withWorld({
+    env: { CLR_INPUT_CHECK_COMMANDS: 'exit 1', CLR_INPUT_FIX_COMMAND: 'echo x >> auto.txt' },
+  }, async (w) => {
+    await init(w.rt);
+    const slots = await drive(w, (info) => (info.role === 'fix'
+      ? { output: { addressed: [], not_addressed: [{ id: 'L0', reason: 'cannot fix' }] } }
+      : review(info.layer)));
+    assert.deepEqual(kinds(slots).slice(0, 6), ['push:L0', 'push:L0', 'push:L0', 'fix:L0', 'fix:L0', 'fix:L0']);
+    const state = loadState(w.rt);
+    assert.equal(state.l0.autofix_runs, 3, 'at most three fix_command runs');
+    const heads = state.l0.history.filter((h) => h.kind === 'run').map((h) => h.head);
+    assert.equal(new Set(heads).size, heads.length, 'the checks never ran twice at one head');
+    assert.equal(state.l0.history.filter((h) => h.kind === 'autofix').length, 3);
+    assert.ok(state.l0.history.filter((h) => h.kind === 'autofix').every((h) => h.pushed));
+    assert.equal(git(w.origin, 'rev-parse', 'refs/heads/feature'), state.head);
+  });
+});
+
+test('e2e L0: fix_command needs room for a push slot: one slot left is enough, none left means it is not run', async () => {
+  const world = {
+    prFiles: { BAD: 'remove me\n' },
+    env: { CLR_INPUT_CHECK_COMMANDS: 'test ! -e BAD', CLR_INPUT_FIX_COMMAND: 'rm -f BAD' },
+  };
+  await withWorld(world, async (w) => {
+    await init(w.rt);
+    const st = loadState(w.rt);
+    st.slots_used = MAX_SLOTS - 1;
+    saveState(w.rt, st);
+    const slots = await drive(w, cleanReviewer);
+    assert.deepEqual(kinds(slots), ['push:L0'], 'the last slot goes to the push; the reviews that follow cannot start');
+    const state = loadState(w.rt);
+    assert.equal(state.l0.autofix_runs, 1);
+    assert.equal(state.l0.status, 'pass');
+    assert.equal(state.done_reason, 'slots');
+  });
+  await withWorld(world, async (w) => {
+    await init(w.rt);
+    const st = loadState(w.rt);
+    st.slots_used = MAX_SLOTS;
+    saveState(w.rt, st);
+    const slots = await drive(w, cleanReviewer);
+    assert.deepEqual(slots, []);
+    const state = loadState(w.rt);
+    assert.equal(state.l0.autofix_runs, 0, 'fix_command did not run');
+    assert.equal(existsSync(join(w.work, 'BAD')), true);
+    assert.equal(state.head, w.head);
+    assert.ok(state.notes.some((n) => /fix_command was not run: not enough job time or agent steps left to push/.test(n)));
+    assert.equal(state.stop, null, 'nothing was left unpushed');
+  });
+});
+
+test('the workflow YAML and the driver agree: 60 step/agent pairs, a per-slot timeout, and no github_token input', () => {
+  const yml = readText(WORKFLOW);
+  const count = (re) => (yml.match(re) || []).length;
+  assert.equal(MAX_SLOTS, 60);
+  assert.equal(count(/^\s*- (?:&|\*)clr-step\s*$/gm), MAX_SLOTS);
+  assert.equal(count(/^\s*- (?:&|\*)clr-agent\s*$/gm), MAX_SLOTS);
+  assert.doesNotMatch(yml, /^\s*github_token:/m, 'the action must exchange the OIDC token for the Claude App token itself');
+  assert.match(yml, /fromJSON\(env\.CLR_STEP_TIMEOUT\)/);
+  assert.match(yml, /CLR_INPUT_AGENT_STEP_TIMEOUT_MINUTES:/);
+  assert.match(yml, /CLR_CALLER_WORKFLOW_REF:/);
 });
 
 // ---------------------------------------------------------------------------------------------------

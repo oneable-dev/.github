@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 import { changedFiles, isAncestor, oldestOf } from './gitops.mjs';
+import { NO_PUSH_ROOM } from './state.mjs';
 import { REPORT_HEADER, encodeStateMarker, headMarker } from './scope.mjs';
 import { LAYERS, clamp, sanitizeText, shortSha } from './util.mjs';
 
@@ -49,8 +50,19 @@ export function incompleteReason(state, layer) {
   const L = state.layers[layer];
   if (L.reviewed_head === state.head) return '';
   if ((L.attempts[state.head] || 0) >= 2) return `the review failed twice (${L.errors.slice(-1)[0] || 'no usable result'})`;
-  const why = { time: 'not enough job time was left', slots: 'the agent step budget was used up', push: 'the run stopped after a failed push' }[state.stop ? state.stop.reason : stopReasonOf(state)] || 'the run stopped before this review';
+  const reason = state.stop ? state.stop.reason : stopReasonOf(state);
+  if (reason === 'push') return pushFailedByBudget(state) ? 'the run stopped because there was no room left to push a fix commit' : 'the run stopped after a push slot failed';
+  const why = {
+    time: 'not enough job time was left',
+    slots: 'the agent step budget was used up',
+    'app-skip': 'the review was skipped for this pull request',
+  }[reason] || 'the run stopped before this review';
   return why;
+}
+
+/** True when a fix commit stayed unpushed because no push slot could be started (not because a push slot failed). */
+function pushFailedByBudget(state) {
+  return Boolean(state.stop && state.stop.reason === 'push' && state.stop.detail === NO_PUSH_ROOM);
 }
 
 function stopReasonOf(state) {
@@ -71,8 +83,9 @@ function attentionReasons(state) {
   const n = unresolvedBlocking(state).length;
   if (n) r.push(`${n} blocking finding${n === 1 ? ' is' : 's are'} unresolved`);
   if (state.l0.status === 'fail') r.push('the L0 checks still fail');
-  for (const l of LAYERS) if (incompleteReason(state, l)) r.push(`${l} has no complete review`);
-  if (state.stop && state.stop.reason === 'push') r.push('pushing the fix commits was rejected');
+  // A skipped review (the caller workflow changed) is expected, so it does not call for a person by itself.
+  if (!state.app_skip) for (const l of LAYERS) if (incompleteReason(state, l)) r.push(`${l} has no complete review`);
+  if (state.stop && state.stop.reason === 'push') r.push(pushFailedByBudget(state) ? 'a fix commit could not be pushed: not enough job time or agent steps were left' : 'a fix commit could not be pushed');
   if (state.fatal) r.push('the driver stopped on an error');
   if (state.l0.capped || LAYERS.some((l) => state.layers[l].capped)) r.push('a fix limit was reached');
   return r;
@@ -82,8 +95,9 @@ function resultLine(state) {
   const all = allFindings(state).filter((f) => f.severity === 'blocking');
   const open = all.filter((f) => f.status === 'open').length;
   const fixed = all.filter((f) => f.status === 'fixed' || f.status === 'fixed_claimed').length;
-  const incomplete = LAYERS.filter((l) => incompleteReason(state, l));
+  const incomplete = state.app_skip ? [] : LAYERS.filter((l) => incompleteReason(state, l));
   const bits = [];
+  if (state.app_skip) bits.push('review skipped (see Notes)');
   if (open) bits.push(`${open} blocking unresolved`);
   if (fixed) bits.push(`${fixed} blocking fixed by ${state.commits.length} commit${state.commits.length === 1 ? '' : 's'}`);
   if (incomplete.length) bits.push(`review incomplete for ${incomplete.join(', ')}`);
@@ -98,8 +112,8 @@ function l0Section(state, level) {
   if (l0.status === 'skipped') lines.push(`Skipped: ${l0.skipped_reason || 'no check commands configured'}.`);
   else if (l0.status === 'unrun') lines.push('Not run.');
   else lines.push(`Status at ${code(shortSha(l0.ran_head))}: **${l0.status}**${l0.skipped_reason && l0.status !== 'pass' ? ` (${l0.skipped_reason})` : ''}.`);
-  const fixes = l0.history.filter((h) => h.kind === 'autofix').map((h) => `fix command commit ${code(shortSha(h.sha))}`);
-  const agent = state.commits.filter((c) => c.layer === 'L0').map((c) => `agent fix ${code(shortSha(c.sha))} (round ${c.round})`);
+  const fixes = l0.history.filter((h) => h.kind === 'autofix').map((h) => `fix command commit ${code(shortSha(h.sha))}${h.pushed ? '' : ' (not pushed)'}`);
+  const agent = state.commits.filter((c) => c.layer === 'L0').map((c) => `agent fix ${code(shortSha(c.sha))} (round ${c.round})${c.pushed ? '' : ' (not pushed)'}`);
   if (fixes.length || agent.length) lines.push('', `Fixes: ${[...fixes, ...agent].join(', ')}.`);
   if (l0.capped) lines.push('', `Fix limit reached (${state.config.max_fix_rounds} agent rounds).`);
   if (level < 2) {
@@ -117,7 +131,8 @@ function layerSection(state, layer, level, inlined) {
   const L = state.layers[layer];
   const lines = [`### ${LAYER_TITLES[layer]}`, ''];
   const why = incompleteReason(state, layer);
-  if (L.reviewed_head === state.head) lines.push(`Reviewed at ${code(shortSha(state.head))}${L.review_passes > 1 ? ` after ${L.review_passes} passes` : ''}.`);
+  if (state.app_skip && L.reviewed_head !== state.head) lines.push('**Review skipped.** The Claude GitHub App could not review this pull request (see Notes).');
+  else if (L.reviewed_head === state.head) lines.push(`Reviewed at ${code(shortSha(state.head))}${L.review_passes > 1 ? ` after ${L.review_passes} passes` : ''}.`);
   else if (L.last_reviewed_sha && L.review_passes) lines.push(`**Review incomplete.** Last completed at ${code(shortSha(L.last_reviewed_sha))}; ${why}.`);
   else lines.push(`**Review incomplete.** ${why || 'No review completed.'}`);
   if (L.capped) lines.push('', `Fix limit reached (${state.config.max_fix_rounds} rounds).`);
@@ -165,12 +180,13 @@ export function buildReport(rt, state, inlined = new Set()) {
     lines.push(`Scope: ${scope}. Head: ${code(shortSha(state.head))}.${state.bot_trigger ? ' Triggered by a bot, so this was a review only: no checks and no fixes.' : ''}`);
     if (state.commits.length) {
       lines.push('', 'Fix commits:');
-      for (const c of state.commits) lines.push(`- ${code(shortSha(c.sha))} ${mdCell(c.subject)}${c.ids.length ? ` (${c.ids.join(', ')})` : ''}`);
+      for (const c of state.commits) lines.push(`- ${code(shortSha(c.sha))} ${mdCell(c.subject)}${c.ids.length ? ` (${c.ids.join(', ')})` : ''}${c.pushed ? '' : ' (not pushed)'}`);
     }
     lines.push('', ...l0Section(state, level));
     for (const l of LAYERS) lines.push('', ...layerSection(state, l, level, inlined));
     const notes = [...state.notes];
-    if (state.stop && state.stop.reason === 'push') notes.push(`Pushing the fix commits was rejected, so they are not on the branch: ${state.stop.detail || 'unknown reason'}. Another push may have landed in the meantime.`);
+    if (pushFailedByBudget(state)) notes.push(`A fix commit was made but not pushed: ${NO_PUSH_ROOM}.`);
+    else if (state.stop && state.stop.reason === 'push') notes.push(`The push slot did not put the fix commit on the branch, so it is not there: ${state.stop.detail || 'unknown reason'}. Another push may have landed in the meantime.`);
     if (state.fatal) notes.push(`The driver stopped on an error: ${state.fatal}`);
     if (state.fixes_disabled && state.fixes_disabled.startsWith('cap:')) notes.push(`Fixing stopped at ${state.fixes_disabled.slice(4)}: the fix limit was reached. Later layers were reviewed once without fixes.`);
     if (state.fixes_disabled === 'disabled') notes.push('Fixes disabled: automatic fixes are turned off for this workflow (enable_fix is false), so blocking findings are only reported.');

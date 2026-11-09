@@ -7,21 +7,29 @@ name: Claude Review
 # repository at the exact commit of this workflow file). The YAML only repeats
 # "driver step, then run the agent if the driver asked for one":
 #
-#   checkout -> fetch driver -> driver init -> [driver step, agent slot] x 45 -> driver report
+#   checkout -> fetch driver -> driver init -> [driver step, agent slot] x 60 -> driver report
 #
 # - `driver step` collects the result of the previous agent slot, runs the L0 gate (the caller's
-#   setup/check/fix commands), pushes fix commits, and writes CLR_NEXT (agent | done) plus the
-#   prompt and arguments of the next slot to $GITHUB_ENV. After `done`, every later step is skipped.
-# - 45 is the driver's slot limit (MAX_SLOTS in lib/state.mjs). Unused slots cost nothing.
-# - Only the agent slot sees CLAUDE_CODE_OAUTH_TOKEN. Only the driver calls see GH_TOKEN. The caller's
-#   commands run inside the driver without either of them.
+#   setup/check/fix commands), commits fixes locally, and writes CLR_NEXT (agent | done) plus the
+#   prompt, arguments and timeout of the next slot to $GITHUB_ENV. After `done`, every later step is
+#   skipped.
+# - Fix commits are pushed by a push slot: a Claude agent slot that pushes the commits. The action
+#   authenticates it as the Claude GitHub App (`claude[bot]`) through an OIDC token exchange, so the
+#   push triggers the caller's workflows again, which a GITHUB_TOKEN push would not. The job skips
+#   runs triggered by `claude[bot]`, so the loop does not review its own pushes.
+# - 60 is the driver's slot limit (MAX_SLOTS in lib/state.mjs). Unused slots cost nothing.
+# - Only the agent slot sees CLAUDE_CODE_OAUTH_TOKEN and the app token. Only the driver calls see
+#   GH_TOKEN (read access to contents, comments and fetches). The caller's commands run inside the
+#   driver without any of them.
 #
 # Runner requirement: `git` and `gh` must be installed in /usr/bin or /usr/local/bin. The driver looks only
 # in a fixed system PATH (SYSTEM_PATH in lib/util.mjs), never in the job PATH that L0 commands can change.
 # `ubuntu-latest` provides both.
 #
-# Caller requirement: the caller job must grant `contents: write`, `pull-requests: write` and
-# `issues: write`. A called workflow can never exceed the caller's permissions.
+# Caller requirement: the caller job must grant `contents: read`, `pull-requests: write`,
+# `issues: write` and `id-token: write` (needed for the Claude GitHub App token exchange). The Claude
+# GitHub App must be installed on the repository. A called workflow can never exceed the caller's
+# permissions.
 
 on:
   workflow_call:
@@ -95,7 +103,7 @@ on:
         required: false
         default: 120
       agent_step_timeout_minutes:
-        description: "Timeout of one agent slot in minutes. Keep it below 25, the time the driver needs left to start a slot."
+        description: "Default timeout of one agent slot in minutes. The driver sets the timeout per slot (CLR_STEP_TIMEOUT): a fix slot is started only with 35 minutes of job time left, and a push slot gets a 5 minute timeout. Keep it below 25, the time the driver needs left to start a slot."
         type: number
         required: false
         default: 20
@@ -140,25 +148,29 @@ jobs:
   review:
     name: Claude Review
     # Only same-repository, non-draft pull_request events. Fork PRs are skipped
-    # because they do not receive secrets. Bot authors and bot pushes are NOT skipped.
+    # because they do not receive secrets. Bot authors and other bots' pushes are NOT skipped, but
+    # runs triggered by claude[bot] are: those are the push slot's own commits, already reviewed.
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.triggering_actor != 'claude[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes }}
     concurrency:
       group: claude-review-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
-    # contents: write lets the driver push fix commits to the PR branch (not .github/workflows/**).
-    # No id-token: the action skips the OIDC app-token exchange when github_token is passed.
+    # contents: read is enough for the driver (checkout and fetch). Pushes to the PR branch are made
+    # by the push slot with the Claude GitHub App token, not with this job's token.
+    # id-token: write lets the action exchange the OIDC token for that app token (no github_token input).
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
       issues: write
+      id-token: write
     steps:
       # actions/checkout v6.1.0
-      # persist-credentials is off: the driver passes the token to git itself, only for fetch and push.
+      # persist-credentials is off: the driver passes the token to git itself, only for fetch.
       - name: Checkout PR head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -217,6 +229,8 @@ jobs:
           CLR_INPUT_ENABLE_FIX: ${{ inputs.enable_fix }}
           CLR_INPUT_MAX_FIX_ROUNDS: ${{ inputs.max_fix_rounds }}
           CLR_INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          CLR_INPUT_AGENT_STEP_TIMEOUT_MINUTES: ${{ inputs.agent_step_timeout_minutes }}
+          CLR_CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           CLR_INPUT_EXTRA_PROMPT: ${{ inputs.extra_prompt }}
           CLR_INPUT_ALLOWED_BOTS: ${{ inputs.allowed_bots }}
           CLR_INPUT_SETUP_COMMAND: ${{ inputs.setup_command }}
@@ -226,7 +240,7 @@ jobs:
           "$CLR_NODE" "$CLR_SRC/.github/claude-review/driver.mjs" init
 
       # Agent slots. Each pair below is: collect the last result and prepare the next slot, then run the
-      # agent when the driver asked for one. The first pair is written out; the other 44 are YAML
+      # agent when the driver asked for one. The first pair is written out; the other 59 are YAML
       # aliases of it (GitHub Actions supports anchors). If the driver step itself fails, CLR_NEXT is set
       # to done so no later slot runs on stale input; the report step still runs.
       - &clr-step
@@ -238,12 +252,13 @@ jobs:
         run: |
           "$CLR_NODE" "$CLR_SRC/.github/claude-review/driver.mjs" step || { echo "CLR_NEXT=done" >> "$GITHUB_ENV"; exit 1; }
       # continue-on-error: a failed or timed-out agent is recorded by the next driver step as an
-      # incomplete review, never as a pass. The OAuth token is passed only here.
+      # incomplete review, never as a pass. The OAuth token is passed only here. The timeout comes
+      # from the driver per slot (CLR_STEP_TIMEOUT, minutes); the input is the fallback.
       - &clr-agent
         name: Claude agent
         if: ${{ env.CLR_NEXT == 'agent' && !cancelled() }}
         continue-on-error: true
-        timeout-minutes: ${{ inputs.agent_step_timeout_minutes }}
+        timeout-minutes: ${{ env.CLR_STEP_TIMEOUT != '' && fromJSON(env.CLR_STEP_TIMEOUT) || inputs.agent_step_timeout_minutes }}
         # anthropics/claude-code-action v1.0.269
         uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
         with:
@@ -254,8 +269,37 @@ jobs:
           # The driver reads the structured output and posts comments itself.
           classify_inline_comments: 'false'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ github.token }}
           allowed_bots: ${{ inputs.allowed_bots }}
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
+      - *clr-step
+      - *clr-agent
       - *clr-step
       - *clr-agent
       - *clr-step
