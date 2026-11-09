@@ -11,12 +11,14 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { changedFiles, ensureBaseRef } from './gitops.mjs';
-import { clamp, sanitizeText } from './util.mjs';
+import { LAYERS, clamp, sanitizeText } from './util.mjs';
 
 export const RULE_DOC = /(^|\/)(AGENTS|CLAUDE|ARCHITECTURE[^/]*)\.md$/i;
 const MAX_RULE_FILES = 50;
 const MAX_RULE_BYTES = 100_000;
 const MAX_ISSUES = 10;
+const MAX_OTHER_FIXES = 10;
+const MAX_FIX_DIFF = 4000;
 
 const hasText = (s) => String(s || '').replace(/<!--[\s\S]*?-->/g, '').replace(/^#{1,6}\s.*$/gm, '').trim().length > 0;
 
@@ -82,6 +84,44 @@ const slim = (f) => ({
   title: f.title, detail: f.detail, ...(f.attack_path ? { attack_path: f.attack_path } : {}), fix_hint: f.fix_hint, ...(f.fix_sha ? { fix_commit: f.fix_sha } : {}), ...(f.note ? { note: f.note } : {}),
 });
 
+/**
+ * What the last L0 run did, for every slot. It lives in scope.json, not only in l0-log.txt, because the log
+ * can be cut and can be older than the head under review: `at_current_head` says which.
+ */
+function l0Summary(state) {
+  const l0 = state.l0;
+  return {
+    status: l0.status,
+    ran_head: l0.ran_head,
+    at_current_head: Boolean(l0.ran_head) && l0.ran_head === state.head,
+    skipped_reason: l0.skipped_reason || null,
+    commands: l0.results || [],
+  };
+}
+
+/**
+ * Blocking findings of the other review layers that a commit of this run already fixed (or claims to have fixed,
+ * until their reviewer looks again). A fixer needs them so it does not undo them; a reviewer needs them so its
+ * fix_hint does not ask for the opposite. The diff is embedded for fixers only, because they have no shell.
+ */
+function otherLayerFixes(rt, state, layer, { withDiff }) {
+  const out = [];
+  for (const other of LAYERS) {
+    if (other === layer) continue;
+    for (const f of state.layers[other].findings) {
+      if (out.length >= MAX_OTHER_FIXES) return out;
+      if (f.severity !== 'blocking' || !f.fix_sha || !['fixed_claimed', 'fixed'].includes(f.status)) continue;
+      const entry = { layer: other, id: f.id, title: clamp(sanitizeText(f.title), 200), detail: clamp(sanitizeText(f.detail), 600), file: f.file, line: f.line, fix_commit: f.fix_sha };
+      if (withDiff) {
+        const shown = rt.git(['show', '--format=', '--no-color', '-U3', f.fix_sha], { check: false });
+        entry.fix_diff = clamp(shown.status === 0 ? shown.stdout : '', MAX_FIX_DIFF);
+      }
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
 export function writeSlotInputs(rt, state, { role, layer }) {
   const L = layer === 'L0' ? null : state.layers[layer];
   const head = state.head;
@@ -103,6 +143,7 @@ export function writeSlotInputs(rt, state, { role, layer }) {
     pr_changed_files: files.slice(0, 500),
     rules_docs_changed: state.rules_docs_changed,
     failing_l0_commands: layer === 'L0' ? state.l0.failures.map((f) => f.command) : undefined,
+    l0: l0Summary(state),
   };
   writeFileSync(join(rt.inDir, 'scope.json'), JSON.stringify(scope, null, 2));
   if (L && role === 'review') {
@@ -110,6 +151,7 @@ export function writeSlotInputs(rt, state, { role, layer }) {
       layer,
       has_requirements: Boolean(state.has_requirements),
       prior_findings: L.findings.filter((f) => f.severity === 'blocking' && (f.status === 'open' || f.status === 'fixed_claimed')).map(slim),
+      other_layer_fixes: otherLayerFixes(rt, state, layer, { withDiff: false }),
       ...(layer === 'L1' ? { previous_requirements: L.requirements } : {}),
     };
     writeFileSync(join(rt.inDir, `findings-${layer}.json`), JSON.stringify(body, null, 2));
@@ -117,7 +159,12 @@ export function writeSlotInputs(rt, state, { role, layer }) {
     const open = L.findings.filter((f) => f.severity === 'blocking' && f.status === 'open').map((f) => ({
       ...slim(f), ...(f.note ? { previous_attempt: f.note } : {}),
     }));
-    writeFileSync(join(rt.inDir, `findings-${layer}.json`), JSON.stringify({ layer, findings: open }, null, 2));
+    writeFileSync(join(rt.inDir, `findings-${layer}.json`), JSON.stringify({
+      layer,
+      findings: open,
+      other_layer_fixes: otherLayerFixes(rt, state, layer, { withDiff: true }),
+      acceptance_criteria: state.layers.L1.requirements.map(({ criterion, status }) => ({ criterion, status })),
+    }, null, 2));
   }
   return scope;
 }

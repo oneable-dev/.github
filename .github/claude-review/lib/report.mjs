@@ -8,6 +8,7 @@
  */
 import { createHash } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
+import { CONFLICT_REOPENS } from './findings.mjs';
 import { changedFiles, isAncestor, oldestOf } from './gitops.mjs';
 import { NO_PUSH_ROOM } from './state.mjs';
 import { REPORT_HEADER, encodeStateMarker, headMarker } from './scope.mjs';
@@ -88,7 +89,18 @@ function attentionReasons(state) {
   if (state.stop && state.stop.reason === 'push') r.push(pushFailedByBudget(state) ? 'a fix commit could not be pushed: not enough job time or agent steps were left' : 'a fix commit could not be pushed');
   if (state.fatal) r.push('the driver stopped on an error');
   if (state.l0.capped || LAYERS.some((l) => state.layers[l].capped)) r.push('a fix limit was reached');
+  if (LAYERS.some((l) => state.layers[l].conflict)) r.push('fixes from different layers kept undoing each other');
   return r;
+}
+
+/** Which finding was reopened twice after another layer's fix, for the Notes. */
+function conflictNote(state, layer) {
+  const L = state.layers[layer];
+  const f = L && L.findings.find((x) => x.severity === 'blocking' && x.status === 'open' && x.conflict && (x.cross_reopens || 0) >= CONFLICT_REOPENS);
+  const what = f
+    ? `${f.id} was reopened twice after fixes from ${f.conflict.layer} (${shortSha(f.conflict.sha)}) changed the same files`
+    : 'a finding was reopened twice after fixes from another layer changed the same files';
+  return `Fixing stopped at ${layer}: ${what}. Later layers were reviewed once without fixes.`;
 }
 
 function resultLine(state) {
@@ -136,6 +148,7 @@ function layerSection(state, layer, level, inlined) {
   else if (L.last_reviewed_sha && L.review_passes) lines.push(`**Review incomplete.** Last completed at ${code(shortSha(L.last_reviewed_sha))}; ${why}.`);
   else lines.push(`**Review incomplete.** ${why || 'No review completed.'}`);
   if (L.capped) lines.push('', `Fix limit reached (${state.config.max_fix_rounds} rounds).`);
+  if (L.conflict) lines.push('', 'Fixing stopped: fixes from different layers kept undoing each other.');
 
   if (layer === 'L1' && L.requirements.length && level < 2) {
     lines.push('', 'Acceptance criteria:', '', '| Criterion | Status | Evidence |', '| --- | --- | --- |');
@@ -189,6 +202,7 @@ export function buildReport(rt, state, inlined = new Set()) {
     else if (state.stop && state.stop.reason === 'push') notes.push(`The push slot did not put the fix commit on the branch, so it is not there: ${state.stop.detail || 'unknown reason'}. Another push may have landed in the meantime.`);
     if (state.fatal) notes.push(`The driver stopped on an error: ${state.fatal}`);
     if (state.fixes_disabled && state.fixes_disabled.startsWith('cap:')) notes.push(`Fixing stopped at ${state.fixes_disabled.slice(4)}: the fix limit was reached. Later layers were reviewed once without fixes.`);
+    if (state.fixes_disabled && state.fixes_disabled.startsWith('conflict:')) notes.push(conflictNote(state, state.fixes_disabled.slice(9)));
     if (state.fixes_disabled === 'disabled') notes.push('Fixes disabled: automatic fixes are turned off for this workflow (enable_fix is false), so blocking findings are only reported.');
     if (state.fixes_disabled === 'slots') notes.push('Fixing stopped because the agent step budget was nearly used up.');
     if (state.fixes_disabled === 'time') notes.push('Fixing stopped because the job time budget was nearly used up.');

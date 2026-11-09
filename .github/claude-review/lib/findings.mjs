@@ -92,6 +92,9 @@ export function applyPolicy(layer, f, ctx = {}) {
   return f;
 }
 
+/** Reopens after a fix from another review layer touched the same files, at which fixing stops for the layer. */
+export const CONFLICT_REOPENS = 2;
+
 export const isOpenBlocking = (f) => f.severity === 'blocking' && f.status === 'open';
 export const openBlocking = (layerState) => layerState.findings.filter(isOpenBlocking);
 
@@ -100,6 +103,33 @@ const sameFinding = (a, b) => a.file === b.file && a.title.toLowerCase() === b.t
 export function nextId(state, layer) {
   state.counter[layer] = (state.counter[layer] || 0) + 1;
   return `${layer}-${state.counter[layer]}`;
+}
+
+/**
+ * A finding whose fix was claimed was just reopened. When a later fix commit of another review layer (not
+ * L0, which only runs checks) changed a file this finding's own fix commit changed, that fix may have undone
+ * this one. Count it, remember which commit, and leave a note for the next fixer. Only commits of this run
+ * are known, so a finding carried over from an earlier run never counts.
+ */
+export function noteCrossLayerReopen(state, p) {
+  const commits = state.commits || [];
+  const own = p.last_fix_sha ? commits.findIndex((c) => c.sha === p.last_fix_sha) : -1;
+  if (own < 0) return false;
+  const ownFiles = new Set(commits[own].files || []);
+  if (!ownFiles.size) return false;
+  let hit = null;
+  let file = '';
+  for (const c of commits.slice(own + 1)) {
+    if (c.layer === p.layer || c.layer === 'L0') continue;
+    const shared = (c.files || []).find((x) => ownFiles.has(x));
+    if (shared) { hit = c; file = shared; }
+  }
+  if (!hit) return false;
+  p.cross_reopens = (p.cross_reopens || 0) + 1;
+  p.conflict = { layer: hit.layer, sha: hit.sha, ids: (hit.ids || []).slice(0, 10) };
+  const ids = p.conflict.ids.length ? ` (${p.conflict.ids.join(', ')})` : '';
+  p.note = clamp(sanitizeText(`Reopened after the ${hit.layer} fix ${String(hit.sha).slice(0, 7)}${ids} changed ${file}, which this finding's fix also changed. Keep both fixes.`), 600);
+  return true;
 }
 
 /** Fold one completed review into the state. Returns the number of new blocking findings. */
@@ -122,11 +152,13 @@ export function applyReview(state, layer, out, head) {
         p.status = p.status === 'fixed_claimed' ? 'fixed' : 'resolved';
         p.note = '';
       } else {
-        if (p.status === 'fixed_claimed') { p.reopened = (p.reopened || 0) + 1; p.last_fix_sha = p.fix_sha; p.fix_sha = ''; }
+        const wasClaimed = p.status === 'fixed_claimed';
+        if (wasClaimed) { p.reopened = (p.reopened || 0) + 1; p.last_fix_sha = p.fix_sha; p.fix_sha = ''; }
         p.status = 'open';
         const n = normalize({ ...raw, severity: 'blocking' });
         Object.assign(p, { detail: n.detail || p.detail, attack_path: n.attack_path || p.attack_path || '', fix_hint: n.fix_hint || p.fix_hint, line: n.line || p.line });
         p.note = '';
+        if (wasClaimed) noteCrossLayerReopen(state, p);
       }
       continue;
     }
@@ -149,6 +181,7 @@ export function applyReview(state, layer, out, head) {
       p.last_fix_sha = p.fix_sha;
       p.fix_sha = '';
       p.note = 'The re-review did not confirm the fix.';
+      noteCrossLayerReopen(state, p);
     } else if (p.status === 'open' && prior.has(p.id)) {
       p.note = 'The re-review did not mention this finding, so it stays open.';
     }

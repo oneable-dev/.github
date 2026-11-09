@@ -271,7 +271,8 @@ function collect(rt, state) {
   if (sha) {
     // The commit stays local. The next decision is the push slot, which puts it on the branch.
     state.head = sha;
-    state.commits.push({ sha, layer: p.layer, round, subject: fixSubject(p.layer, round), ids: p.layer === 'L0' ? [] : ids, pushed: false });
+    state.commits.push({ sha, layer: p.layer, round, subject: fixSubject(p.layer, round), ids: p.layer === 'L0' ? [] : ids,
+      files: changedFiles(rt, `${sha}^`, sha).slice(0, 200), pushed: false });
     state.push_pending = { sha, layer: p.layer, round, kind: 'fix' };
   } else {
     discardChanges(rt, p.untracked_before);

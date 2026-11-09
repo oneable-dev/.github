@@ -53,7 +53,7 @@ flowchart TD
     L3 -->|blocking, fixes left| F1
     F1 -->|commit, push step, start over| L0
     L3 -->|none or capped| R[Post summary comment]
-    R -->|cap reached or review incomplete| M[Mention assignee or author]
+    R -->|cap reached, conflicting fixes or review incomplete| M[Mention assignee or author]
 ```
 
 - A cycle runs L0, L1, L2, L3 and stops at the first layer with a blocking finding. The
@@ -64,17 +64,30 @@ flowchart TD
 - Fixes are capped at `max_fix_rounds` (default 3) for L0 and for each review layer
   separately. When a layer reaches its cap, fixing stops: the layers after it are
   reviewed once without fixes, and the run ends.
+- Fixing also stops early when fixes from different layers keep undoing each other. The
+  driver records which files each fix commit changed. When a finding whose fix was claimed
+  is reopened after a later fix commit of another review layer (not L0) changed a file
+  that its own fix also changed, the finding counts one cross-layer reopen and the next
+  fixer is told to keep both fixes. At the second such reopen the layer stops fixing,
+  like at the cap, and the layers after it are reviewed once without fixes.
 - Fixing also stops, with the remaining layers only reviewed, when `enable_fix` is
   false, when the run was triggered by a bot, or when the job time or agent step budget
   is nearly used up (a fix is started only with 35 minutes and 5 agent steps left, so
   its push and a re-review still fit).
 - When the run ends with an unresolved blocking finding, failing L0 checks, a layer
-  without a complete review, a rejected push, a reached cap, or a driver that stopped on
-  an error, the summary mentions the PR's first assignee, or the PR author when nobody is
-  assigned.
+  without a complete review, a rejected push, a reached cap, fixes from different layers
+  undoing each other, or a driver that stopped on an error, the summary mentions the PR's
+  first assignee, or the PR author when nobody is assigned.
 - L0 runs the caller's `check_commands` (after `setup_command`, once). If a check fails
   and `fix_command` is set, the driver runs it first and commits what it changed (at
   most three times per run); the L0 fix agent only sees what is left.
+  Every reviewer gets the result of every command (exit code, end of output) at the
+  commit it reviews, and is told when the checks did not run at that commit.
+- The fix agent also gets the blocking findings that other layers had fixed earlier in
+  this run (with their commits and diffs), the latest acceptance criteria and the
+  requirements. It is told to keep them, to find a change that satisfies both, and to
+  report a conflict (`conflict with <id>`) instead of undoing a fix. Reviewers see the
+  same fixes (without diffs) so their fix hints do not ask for a revert.
 - A review that fails twice on the same commit is reported as incomplete, never as a
   pass.
 

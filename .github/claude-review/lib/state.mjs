@@ -101,6 +101,7 @@ export function emptyL0() {
     setup_done: false,
     capped: false,
     failures: [],
+    results: [], // every command of the last run: {command, result, exit_code, seconds, timed_out, skipped}
     history: [],
     skipped_reason: '',
   };
