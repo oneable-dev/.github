@@ -18,7 +18,7 @@ import { cleanOriginUrl, scrubCheckoutCredentials } from './gitops.mjs';
 
 export const ROOT = fileURLToPath(new URL('../', import.meta.url));
 
-export const REVIEW_TOOLS = 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*)';
+export const REVIEW_TOOLS = 'Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(gh pr view:*),Bash(gh pr diff:*)';
 export const FIX_TOOLS = 'Read,Grep,Glob,Edit,MultiEdit,Write';
 export const PUSH_COMMAND = 'git push origin HEAD';
 export const PUSH_TOOLS = `Bash(${PUSH_COMMAND})`;

@@ -54,7 +54,7 @@ const MENTION_PROTECTED_SEGMENTS = new Set([...PROTECTED_SEGMENTS, 'codeowners']
 
 // Read-only Bash commands of the review role (mirrors the Bash(...) entries of REVIEW_TOOLS).
 const REVIEW_BASH = [
-  ['git', 'diff'], ['git', 'log'], ['git', 'show'], ['gh', 'pr', 'view'], ['gh', 'pr', 'diff'],
+  ['git', 'diff'], ['git', 'log'], ['git', 'show'], ['git', 'status'], ['gh', 'pr', 'view'], ['gh', 'pr', 'diff'],
 ];
 // Read-only commands of the mention roles. `git status` is added because the action's prompt suggests it;
 // `gh` is not needed in tag mode.

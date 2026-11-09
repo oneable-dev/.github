@@ -16,7 +16,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { init, main, report, step } from './driver.mjs';
 import { buildArgs, readSlotResult, renderPrompt, resetInDir, slotMaxTurns, writeGithubEnv } from './lib/agent.mjs';
-import { hookScript, selfTestHooks, settingsPath } from './lib/hooks.mjs';
+import { describeDeniedCalls, hookScript, sanitizeLogText, selfTestHooks, settingsPath, summarizeHookLog } from './lib/hooks.mjs';
 import { applyFix, applyPolicy, applyReview } from './lib/findings.mjs';
 import { RESTORE_PATHS, commitAll } from './lib/gitops.mjs';
 import { writeSlotInputs } from './lib/inputs.mjs';
@@ -270,7 +270,7 @@ test('buildArgs: reviewers are read-only, fix agents can edit but have no shell,
   const cfg = readConfig({});
   const r = buildArgs(cfg, { role: 'review', layer: 'L2', inDir: '/tmp/in' });
   assert.match(r, /--model claude-opus-5-5 --effort high --max-turns 30 /);
-  assert.match(r, /--allowedTools "Read,Grep,Glob,Bash\(git diff:\*\),Bash\(git log:\*\),Bash\(git show:\*\),Bash\(gh pr view:\*\),Bash\(gh pr diff:\*\)"/);
+  assert.match(r, /--allowedTools "Read,Grep,Glob,Bash\(git diff:\*\),Bash\(git log:\*\),Bash\(git show:\*\),Bash\(git status:\*\),Bash\(gh pr view:\*\),Bash\(gh pr diff:\*\)"/);
   assert.doesNotMatch(r, /Edit|Write|permission-mode|gh pr comment|github_inline/);
   assert.match(r, /--json-schema '\{.*"layer".*\}' --add-dir \/tmp\/in$/);
   const f = buildArgs(cfg, { role: 'fix', layer: 'L2', inDir: '/tmp/in' });
@@ -302,6 +302,24 @@ test('prompts: every template renders, holds only trusted text, and rejects unkn
   assert.match(renderPrompt('review-l3', vars), /AGENTS\.md:42/);
   assert.match(renderPrompt('review-l1', { ...vars, EXTRA: '## Additional repository-specific instructions\n\nBe terse.' }), /Be terse\./);
   assert.throws(() => renderPrompt('review-l1', { IN_DIR: 'x' }), /unknown placeholder/);
+});
+
+test('prompts: reviewers get the tool rules, and fix agents are told they have no Bash and no Grep glob', () => {
+  const vars = { IN_DIR: '/tmp/in', LAYER: 'L1', ROUND: '1', EXTRA: '' };
+  for (const name of ['review-l1', 'review-l2', 'review-l3']) {
+    const text = renderPrompt(name, vars);
+    assert.match(text, /## Tool rules/, name);
+    assert.match(text, /one command per call, and only `git diff`, `git log`, `git show`, `git status`, `gh pr view` and `gh pr diff`/, name);
+    assert.match(text, /Do not use pipes, `&&`, `;`, `\$\(\)`, backticks, redirects, backslashes, parentheses or angle brackets, even inside quotes/, name);
+    assert.match(text, /Do not run cat, ls, find, grep, head or similar commands\. Use Read to read a file, Grep to search and Glob to list files/, name);
+    assert.match(text, /Grep takes `path` and `type`, never `glob`/, name);
+    assert.match(text, /`git diff A\.\.\.B -- path`/, name);
+    assert.match(text, /`git show <sha>:<path>`/, name);
+    assert.match(text, /## Untrusted data/, `${name}: the untrusted-data rules stay`);
+  }
+  for (const [name, layer] of [['fix', 'L2'], ['fix-l0', 'L0']]) {
+    assert.match(renderPrompt(name, { ...vars, LAYER: layer }), /no shell and no Bash tool\. Grep takes no `glob` argument/, name);
+  }
 });
 
 test('prompts: the push prompt is fixed trusted text that names the one command', () => {
@@ -1279,6 +1297,121 @@ test('e2e: a push slot that wrote nothing, or whose hook denied the command, sto
     assert.match(detail, /hook log: 1 of 1 tool call\(s\) denied \(push-only x1\)/);
     await report(w.rt);
     assert.match(w.summaries[0], /The push slot did not put the fix commit on the branch/);
+  });
+});
+
+const denyRow = (target, rule = 'bash-metachar', tool_name = 'Bash') => `${JSON.stringify({ ts: 'x', tool_name, target, decision: 'deny', rule })}\n`;
+
+test('hook log: denied calls are listed one line each, at most five, with a count of the rest', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'clr-hooklog-'));
+  try {
+    const log = join(dir, 'h.jsonl');
+    const rows = [`${JSON.stringify({ ts: 'x', tool_name: 'Read', target: 'src/a.ts', decision: 'allow', rule: 'read-ok' })}\n`, denyRow('git diff | head', 'bash-metachar')];
+    for (let i = 0; i < 6; i++) rows.push(denyRow(`ls ${i}`, 'bash-not-allowed'));
+    writeFileSync(log, rows.join(''));
+    const summary = summarizeHookLog(log);
+    assert.equal(summary.denied, 7);
+    assert.equal(summary.total, 8);
+    assert.deepEqual(describeDeniedCalls(summary), [
+      '  denied bash-metachar: Bash git diff | head',
+      '  denied bash-not-allowed: Bash ls 0',
+      '  denied bash-not-allowed: Bash ls 1',
+      '  denied bash-not-allowed: Bash ls 2',
+      '  denied bash-not-allowed: Bash ls 3',
+      '  ... and 2 more',
+    ]);
+    assert.deepEqual(describeDeniedCalls(summarizeHookLog(join(dir, 'missing.jsonl'))), []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('hook log: targets are one line, tokens and long secrets are masked, and :: cannot start a workflow command', () => {
+  const token = 'ghs_16C7e42F292c6912E7710c838347Ae178B4a';
+  const out = sanitizeLogText(`git log\n::add-mask::x\r::error::boom ${token} github_pat_11ABCDEFG0abcdefghijklmnop_qrstuv https://x-access-token:${token}@github.com/o/r ${'A1b2'.repeat(12)} ghp_ end`);
+  assert.doesNotMatch(out, /[\n\r]/);
+  assert.doesNotMatch(out, /::/);
+  assert.doesNotMatch(out, /ghs_|ghp_|github_pat_|x-access-token|A1b2A1b2/);
+  assert.match(out, /^git log : ?: ?add-mask: ?:x/);
+  assert.match(out, /\*\*\* end$/);
+  assert.equal(sanitizeLogText(':::'), ': : :');
+  assert.equal(sanitizeLogText('ab '.repeat(100)).length, 200);
+  assert.equal(sanitizeLogText('git diff -- src/a.ts'), 'git diff -- src/a.ts');
+  const lines = describeDeniedCalls({ denied: 1, calls: [{ rule: 'bash-metachar\n::warning::r', tool: 'Bash::x', target: `::error::${token}` }] });
+  assert.equal(lines.length, 1);
+  assert.doesNotMatch(lines[0], /::|ghs_/);
+  assert.match(lines[0], /^ {2}denied /);
+});
+
+test('hook log: ##[ and :: cannot form a workflow command anywhere in the line, even through hidden characters', () => {
+  const token = 'ghs_16C7e42F292c6912E7710c838347Ae178B4a';
+  const inputs = [
+    '##[error]boom', 'x ##[stop-commands]tok', '##[add-mask]x', '##[set-output name=a;]b', '##[ERROR]x',
+    '##\u200b[error]x', '#\u200d#\ufeff[error]x', '#\n#[error]x', '#\r\n#[error]x', '#\u2028#[error]x', '#\u202f#[error]x',
+    '###[error]x', '#####[x', '# ##[error]', '#\u00ad#[error]', '#\u202e#[error]',
+    '::error::x', ':\u200b:error::x', ':\u2060:add-mask::x', ':\n:error::x', '\u200b::error::x', ':::::', '%0A::error::x',
+    `#${token}#[error]`, `##[add-mask]${token}`,
+    `gh\u200bs_${'a1B2'.repeat(9)}`,
+  ];
+  for (const input of inputs) {
+    const out = sanitizeLogText(input);
+    assert.ok(!out.includes('##['), `##[ left in ${JSON.stringify(input)} => ${JSON.stringify(out)}`);
+    assert.ok(!/^::/.test(out) && !out.includes('::'), `:: left in ${JSON.stringify(input)} => ${JSON.stringify(out)}`);
+    assert.doesNotMatch(out, /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u, `hidden character left in ${JSON.stringify(input)}`);
+    assert.doesNotMatch(out, /ghs_|a1B2a1B2/);
+    const line = describeDeniedCalls({ denied: 1, calls: [{ rule: input, tool: input, target: input }] })[0];
+    assert.ok(!line.includes('##['), `##[ left in line for ${JSON.stringify(input)}`);
+    assert.match(line, /^ {2}denied /); // the line starts with fixed text, so `::` can never be at its start
+  }
+  assert.equal(sanitizeLogText('##[error]x'), '# #[error]x');
+  assert.equal(sanitizeLogText('##\u200b[error]'), '# #[error]');
+  assert.equal(sanitizeLogText('#\n#[error]'), '# #[error]');
+  assert.equal(sanitizeLogText(`gh\u200bs_${'a1B2'.repeat(9)}`), '***');
+  assert.equal(sanitizeLogText('git diff -- src/a.ts # not a command [x]'), 'git diff -- src/a.ts # not a command [x]');
+});
+
+test('hook log: default-ignorable marks (U+034F, variation selectors) cannot split a token or a marker, and configured secrets are redacted before and after sanitizing', () => {
+  const token = `ghs_${'a1B2'.repeat(9)}`;
+  for (const z of ['\u034f', '\ufe0f', '\ufe00', '\u180b', '\u180f', '\u{e0100}', '\u{e01ef}', '\u3164', '\u115f']) {
+    const split = (t, n) => t.slice(0, n) + z + t.slice(n);
+    const out = sanitizeLogText(split(split(token, 1), 25));
+    assert.equal(out, '***', `token split by U+${z.codePointAt(0).toString(16)} => ${JSON.stringify(out)}`);
+    assert.ok(!sanitizeLogText(`#${z}#[error]x`).includes('##['), `##[ built with U+${z.codePointAt(0).toString(16)}`);
+    assert.ok(!sanitizeLogText(`:${z}:error::x`).includes('::'), `:: built with U+${z.codePointAt(0).toString(16)}`);
+  }
+  // all four mark families in one token, split twice each
+  const mixed = [...token].map((c, i) => c + ['\u034f', '\ufe0f', '\u180b', '\u{e0100}'][i % 4]).join('');
+  assert.equal(sanitizeLogText(mixed), '***');
+  // a secret that sanitizing would reshape (it holds `::` and a control character) is still redacted
+  const secret = 'pw::a\u0001bc';
+  const [line] = describeDeniedCalls({ denied: 1, calls: [{ rule: 'r', tool: 'Bash', target: `echo ${secret} ok` }] }, [secret]);
+  assert.equal(line, '  denied r: Bash echo *** ok');
+  assert.doesNotMatch(describeDeniedCalls({ denied: 1, calls: [{ rule: secret, tool: secret, target: secret }] }, [secret]).join('\n'), /pw/);
+  // a visible character inside a token is not detected: this is a documented limit, not a guarantee
+  assert.notEqual(sanitizeLogText(`${token.slice(0, 10)}.${token.slice(10)}`), '***');
+});
+
+test('e2e: denied calls of a review slot are written to the job log under the hook count line, masked', async () => {
+  await withWorld({}, async (w) => {
+    await init(w.rt);
+    let first = true;
+    const slots = await drive(w, (info, world) => {
+      if (first) {
+        first = false;
+        writeFileSync(info.pending.hook_log, [
+          denyRow('git diff | head -5'),
+          denyRow('::set-output name=x::y ghs_16C7e42F292c6912E7710c838347Ae178B4a', 'bash-not-allowed'),
+          denyRow('x', 'bash-not-allowed'), denyRow('y', 'bash-not-allowed'), denyRow('z', 'bash-not-allowed'), denyRow('w', 'bash-not-allowed'),
+        ].join(''));
+      }
+      return cleanReviewer(info, world);
+    });
+    assert.ok(slots.length > 0);
+    const at = w.logs.findIndex((m) => /^review slot hook: 6 of 6 tool call\(s\) denied/.test(m));
+    assert.ok(at >= 0, w.logs.join('\n'));
+    assert.equal(w.logs[at + 1], '  denied bash-metachar: Bash git diff | head -5');
+    assert.match(w.logs[at + 2], /^ {2}denied bash-not-allowed: Bash : : ?set-output name=x: ?: ?y \*\*\*$/);
+    assert.equal(w.logs[at + 5], '  denied bash-not-allowed: Bash z');
+    assert.equal(w.logs[at + 6], '  ... and 1 more');
+    assert.equal(w.logs.some((m) => /ghs_/.test(m) || m.startsWith('::set-output')), false);
   });
 });
 

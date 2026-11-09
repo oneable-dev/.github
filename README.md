@@ -278,7 +278,7 @@ Never commit the token or paste it into a workflow file, issue, or chat.
 
   | Role | Allowed |
   | --- | --- |
-  | `review` | Read, Grep, Glob, `git diff/log/show`, `gh pr view/diff`, and `StructuredOutput` for the result. No writes. |
+  | `review` | Read, Grep, Glob, `git diff/log/show/status`, `gh pr view/diff`, and `StructuredOutput` for the result. No writes. |
   | `fix` | Read, Grep, Glob, and Edit/MultiEdit/Write inside the checkout, outside the input directory and the protected paths. No shell. |
   | `push` | Exactly `git push origin HEAD`. Nothing else. |
   | `mention` | Reads, read-only git, file edits (same path rules, plus CODEOWNERS), `git add/rm/commit` with checked paths, the action's push wrapper for the current branch (never a branch named `main` or `master`), the tracking-comment tool, `ToolSearch` (loads tool schemas only), the read-only CI MCP tools (`get_ci_status`, `get_workflow_run_details`), and the file-ops MCP tools (`commit_files`, `delete_files`) with the same path checks. The file-ops tools only exist with `use_commit_signing`, which the Mention workflow does not enable. |
@@ -288,6 +288,19 @@ Never commit the token or paste it into a workflow file, issue, or chat.
   `!.git` exclusion, so a glob such as `*.git` would re-include `.git/config`, where
   checkout credentials can be stored. Matching such patterns is whack-a-mole, so Grep
   keeps `path` and `type` only.
+- Denied calls. After each agent step the driver logs how many tool calls the hook denied,
+  then lists up to 5 of them in the job log (`denied <rule>: <tool> <target>`, plus a count
+  of the rest), so a model that keeps running into the policy can be spotted. The target is
+  taken from the hook log, which can hold pull request text, and the job log is public, so
+  each line is sanitized first: control characters (newlines included) are replaced by
+  spaces, GitHub tokens, `x-access-token` URLs and long base64-like runs become `***`,
+  invisible characters (zero-width, bidi, and every default-ignorable code point such as
+  U+034F and the variation selectors) are removed first so they cannot split a token, `::`
+  and `##[` are split so the text cannot form a workflow command in either syntax, and the
+  line is cut at 200 characters. Any configured secret value is redacted too, before and
+  after sanitizing. Limit: a token deliberately split by visible characters (a dot, a space)
+  is not detected. The masking is a best-effort backstop to the hook and to credential
+  scrubbing, not a guarantee.
 - The hook cannot be switched off by the repository. A workspace `.claude/settings.json`
   with `disableAllHooks: true` is overridden by the `disableAllHooks: false` in the
   step's own `--settings` file. The driver also restores the protected paths from the

@@ -47,7 +47,7 @@ import {
   changedFiles, cleanOriginUrl, commitAll, discardChanges, headSha, listUntracked, prepareCheckoutForPush, remoteHeadSha,
   restoreProtectedFromBase, revertWorkflows, scrubCheckoutCredentials, snapshotProtected,
 } from './lib/gitops.mjs';
-import { describeHookDenials, hookLogPath, selfTestHooks, summarizeHookLog, writeSlotSettings } from './lib/hooks.mjs';
+import { describeDeniedCalls, describeHookDenials, hookLogPath, selfTestHooks, summarizeHookLog, writeSlotSettings } from './lib/hooks.mjs';
 import { collectRules, fetchRequirements, loadPriorFindings, rulesDocsChanged, writeSlotInputs } from './lib/inputs.mjs';
 import { runL0 } from './lib/l0.mjs';
 import { decide } from './lib/plan.mjs';
@@ -58,7 +58,7 @@ import { resolveScope } from './lib/scope.mjs';
 import {
   PUSH_STEP_TIMEOUT_MINUTES, emptyL0, emptyLayer, loadState, readConfig, saveState,
 } from './lib/state.mjs';
-import { LAYERS, createRuntime, readJson } from './lib/util.mjs';
+import { LAYERS, createRuntime, readJson, redact } from './lib/util.mjs';
 
 const FIX_SUBJECT = {
   L0: 'Fix lint, format, type and test failures',
@@ -209,6 +209,7 @@ function collect(rt, state) {
   if (res.sessionId) state.seen_sessions.push(res.sessionId);
   const hook = summarizeHookLog(p.hook_log);
   rt.log(`${p.role} slot hook: ${describeHookDenials(hook)}`);
+  for (const line of describeDeniedCalls(hook, rt.secrets)) rt.log(redact(line, rt.secrets));
   if (!res.ok && p.slot === 1 && /no execution file/.test(res.error)) {
     state.notes.push('The first agent slot wrote no execution file, so the action may have skipped (for example workflow validation).');
   }
