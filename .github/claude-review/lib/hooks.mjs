@@ -12,6 +12,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ROOT } from './agent.mjs';
+import { redact } from './util.mjs';
 
 export const HOOK_ROLES = ['review', 'fix', 'push'];
 export const DENY_MARKER = 'CLR_HOOK_DENY:';
@@ -92,9 +93,16 @@ export function selfTestHooks(rt) {
   }
 }
 
-/** Counts of the denials a slot's hook logged: {total, denied, rules: {rule: count}}. */
+/** How many denied calls are listed in the job log per slot. */
+export const MAX_LOGGED_DENIALS = 5;
+
+/**
+ * Counts of the denials a slot's hook logged: {total, denied, rules: {rule: count}, calls: [{rule, tool,
+ * target}]}. `calls` holds the first MAX_LOGGED_DENIALS denied calls as the hook logged them, unsanitized:
+ * the target comes from the model and can carry pull request text, so print it only through describeDeniedCalls.
+ */
 export function summarizeHookLog(logPath) {
-  const out = { total: 0, denied: 0, rules: {} };
+  const out = { total: 0, denied: 0, rules: {}, calls: [] };
   if (!logPath || !existsSync(logPath)) return out;
   for (const line of readFileSync(logPath, 'utf8').split('\n')) {
     let row;
@@ -105,6 +113,9 @@ export function summarizeHookLog(logPath) {
       out.denied += 1;
       const rule = String(row.rule || 'unknown').slice(0, 60);
       out.rules[rule] = (out.rules[rule] || 0) + 1;
+      if (out.calls.length < MAX_LOGGED_DENIALS) {
+        out.calls.push({ rule, tool: String(row.tool_name ?? ''), target: String(row.target ?? '') });
+      }
     }
   }
   return out;
@@ -113,4 +124,50 @@ export function summarizeHookLog(logPath) {
 export function describeHookDenials(summary) {
   const rules = Object.entries(summary.rules).map(([rule, n]) => `${rule} x${n}`).join(', ');
   return `${summary.denied} of ${summary.total} tool call(s) denied${rules ? ` (${rules})` : ''}`;
+}
+
+const TOKEN_PATTERNS = [
+  // GitHub tokens (also a prefix that the hook's 200 character cut left incomplete) and token-carrying URLs.
+  /x-access-token:[^\s@]*@?/gi,
+  /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]*/g,
+  // Anything that looks like a base64 or hex secret.
+  /[A-Za-z0-9+/=_-]{32,}/g,
+];
+
+/**
+ * One line of text from a denied call, made safe for the public job log. The hook target comes from the
+ * model and can carry pull request text. The steps run in this order, and the order matters:
+ * 1. control characters (newlines included) and line separators become spaces, and invisible characters
+ *    are removed (general category Cf, and every Default_Ignorable_Code_Point: that adds combining grapheme
+ *    joiner U+034F, variation selectors U+FE00-FE0F and U+E0100-E01EF, Mongolian free variation selectors
+ *    U+180B-180F, which are category Mn and render as nothing), so nothing can split or hide a token or a
+ *    command marker from the later steps;
+ * 2. tokens and long base64-like runs are masked (with `***`, which cannot rebuild a marker);
+ * 3. `::` (workflow command) and `##[` (the runner finds it anywhere in a line) are broken up;
+ * 4. the length is capped (cutting only shortens the text).
+ */
+export function sanitizeLogText(text, max = 200) {
+  let out = String(text ?? '')
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}\u202f]+/gu, ' ')
+    .replace(/[\p{Cf}\p{Default_Ignorable_Code_Point}\u2060-\u2064\ufeff\u00ad]+/gu, '');
+  for (const pattern of TOKEN_PATTERNS) out = out.replace(pattern, '***');
+  return out
+    .replace(/:(?=:)/g, ': ')
+    .replace(/#(?=#\[)/g, '# ')
+    .trim()
+    .slice(0, max);
+}
+
+/**
+ * Job log lines for the denied calls of a slot: up to MAX_LOGGED_DENIALS, then a count of the rest. Every raw
+ * field is redacted against `secrets` (configured secret values) before it is sanitized, and the sanitized
+ * text is redacted again: the first pass catches a secret that sanitizing would reshape, the second one a
+ * secret that sanitizing would leave behind.
+ */
+export function describeDeniedCalls(summary, secrets = []) {
+  const clean = (value, max) => redact(sanitizeLogText(redact(value, secrets), max), secrets);
+  const lines = (summary.calls || []).map((c) => `  denied ${clean(c.rule, 60)}: ${clean(c.tool, 60)} ${clean(c.target)}`.trimEnd());
+  const more = summary.denied - lines.length;
+  if (more > 0) lines.push(`  ... and ${more} more`);
+  return lines;
 }

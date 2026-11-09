@@ -130,7 +130,7 @@ test('review: single read-only git and gh commands are allowed', () => {
 });
 test('review: other commands and look-alike prefixes are denied', () => {
   for (const command of [
-    '', 'ls', 'cat .git/config', 'git status', 'git difftool', 'git diffstat', 'git push origin HEAD',
+    '', 'ls', 'cat .git/config', 'git difftool', 'git diffstat', 'git push origin HEAD',
     'git -c core.pager=x diff', 'gh pr merge 12', 'gh pr checkout 12', 'gh api /user', 'gh pr', 'git',
     'env git diff', 'echo git diff',
   ]) {
@@ -225,6 +225,18 @@ test('review: revisions and workspace-relative paths stay allowed', () => {
   ]) {
     assertAllow(rev(command));
   }
+});
+test('review: git status is allowed with the same option and path checks, and cannot be chained', () => {
+  for (const command of ['git status', 'git status --short', 'git status --porcelain=v1 -- src/a.ts', "git status -- 'src/*.ts'"]) {
+    assertAllow(rev(command));
+  }
+  for (const command of ['git status | head', 'git status && id', 'git status; id', 'git status > out', 'git status $(id)']) {
+    assertDeny(rev(command), 'bash-metachar');
+  }
+  assertDeny(rev('git status -- .git/config'), 'bash-path-outside');
+  assertDeny(rev('git status -- ../x'), 'bash-path-outside');
+  assertDeny(rev('git status *'), 'bash-expansion');
+  assertDeny(rev('git statusx'), 'bash-not-allowed');
 });
 test('review: unquoted expansions and unbalanced quotes are denied', () => {
   for (const command of ['git diff *', 'git diff -- src/*.ts', 'git diff {a,b}', 'git diff x?', 'git diff [a]', 'git diff ~/x', 'git diff ~root']) {
