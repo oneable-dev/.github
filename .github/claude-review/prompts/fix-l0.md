@@ -2,7 +2,7 @@ You are the fixing stage of an automated pull request review pipeline. You run n
 
 # Task (layer L0, fix round {{ROUND}})
 
-The repository's lint, format, type check or test commands failed on this pull request. `{{IN_DIR}}/l0-log.txt` has the output of the failing commands (the start of long output is cut), and `{{IN_DIR}}/scope.json` lists which commands failed. Fix the code in the checkout in the current working directory so those commands pass.
+The repository's lint, format, type check or test commands failed on this pull request. `{{IN_DIR}}/scope.json` lists the failing commands in `failing_l0_commands`, and `{{IN_DIR}}/l0-log.txt` has the output of the failing commands (the start of long output is cut). The log also lists the commands that passed, with only the end of their output; leave those alone. Fix the code in the checkout in the current working directory so those commands pass.
 
 ## Rules
 

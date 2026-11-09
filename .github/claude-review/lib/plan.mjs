@@ -8,11 +8,12 @@
  *      is always the push slot, because the driver has no write token. Only after the push is verified does
  *      the cycle start over from L0, then L1, L2, L3, stopping at the first layer with a blocking finding to
  *      fix it; the layers re-review only what changed.
- *      A layer at its fix limit (or any fix-free condition) turns on `fixes_disabled`: the layers after it
+ *      A layer at its fix limit, or whose open finding was reopened twice after fixes of other layers changed the
+ *      same files (or any fix-free condition) turns on `fixes_disabled`: the layers after it
  *      are reviewed once without fixes, then the run stops.
  * Not covered: Running anything (driver.mjs).
  */
-import { openBlocking } from './findings.mjs';
+import { CONFLICT_REOPENS, openBlocking } from './findings.mjs';
 import { LAYERS } from './util.mjs';
 import { MAX_SLOTS, MIN_SECONDS_FOR_AGENT, MIN_SECONDS_FOR_FIX, MIN_SECONDS_FOR_PUSH, NO_PUSH_ROOM } from './state.mjs';
 
@@ -91,6 +92,12 @@ export function decide(state, nowMs) {
     }
     if (L.reviewed_head !== head) continue; // review failed twice; reported as incomplete
     if (openBlocking(L).length === 0 || fixesOff()) continue;
+    // Fixes from different layers keep undoing each other: more rounds only repeat that.
+    if (openBlocking(L).some((f) => (f.cross_reopens || 0) >= CONFLICT_REOPENS)) {
+      L.conflict = true;
+      disableFixes(`conflict:${layer}`);
+      continue;
+    }
     if (L.fixes >= cfg.max_fix_rounds) {
       L.capped = true;
       disableFixes(`cap:${layer}`);

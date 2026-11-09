@@ -55,15 +55,70 @@ function summarize(results) {
   return { failed, skipped, status: failed.length ? 'fail' : skipped.length ? 'incomplete' : 'pass' };
 }
 
-function formatLog(results) {
-  const parts = [];
-  for (const r of results) {
-    if (r.ok) continue;
-    const head = r.skipped ? `$ ${r.label || r.command}\n[not run: not enough job time left]`
-      : `$ ${r.label || r.command}\n[${r.timed_out ? 'timed out' : `exit code ${r.exit_code}`} after ${r.seconds}s]\n${r.output}`;
-    parts.push(head);
+const PASSED_OUTPUT_CHARS = 2000;
+/** Must not exceed the cap resetInDir (agent.mjs) applies when it copies the log for a slot. */
+const LOG_CHARS = 60000;
+
+/** How a command ended, in the words the reviewers read: passed | failed | timed out | not run. */
+const resultOf = (r) => (r.skipped ? 'not run' : r.ok ? 'passed' : r.timed_out ? 'timed out' : 'failed');
+
+/** The light record kept in `state.l0.results` and handed to every slot: no command output. */
+function lightResult(r) {
+  return {
+    command: clamp(sanitizeText(r.label || r.command), 300),
+    result: resultOf(r),
+    exit_code: r.exit_code ?? null,
+    seconds: r.seconds ?? null,
+    timed_out: Boolean(r.timed_out),
+    skipped: Boolean(r.skipped),
+  };
+}
+
+/** The status block lists this many commands at most; the rest are only in scope.json (`l0.commands`). */
+const MAX_STATUS_LINES = 50;
+
+/**
+ * The log of one L0 run: first a status block (the first line names the head and the overall status, then a
+ * line per command, at most MAX_STATUS_LINES), then the output of each command. A failing command keeps its
+ * whole output, a passing one only its end.
+ * The whole log is at most LOG_CHARS. The status block comes first and loses only its end if it is too long
+ * itself (the first line always survives); the output sections lose their start when the rest is too long.
+ * Output sections are written only for the commands listed in the status block.
+ */
+function formatLog(results, head, status) {
+  const listed = results.slice(0, MAX_STATUS_LINES);
+  const lines = listed.map((r) => {
+    const light = lightResult(r);
+    const code = r.skipped ? '' : light.exit_code === null ? ', no exit code' : `, exit code ${light.exit_code}`;
+    const secs = r.skipped ? '' : `, ${light.seconds}s`;
+    return `${light.result}${code}${secs}: $ ${light.command}`;
+  });
+  if (results.length > listed.length) {
+    lines.push(`... and ${results.length - listed.length} more commands; see scope.json l0.commands`);
   }
-  return parts.join('\n\n');
+  const firstLine = `L0 run at commit ${head}: ${status}`.slice(0, LOG_CHARS);
+  const top = [firstLine, ...lines].join('\n');
+  // Leave room for "\n\n" + a section text + "\n"; when the block alone is too long, it is all there is.
+  if (top.length > LOG_CHARS - 1) return `${top.slice(0, LOG_CHARS - 1)}\n`;
+  const sections = listed.map((r) => {
+    const name = `$ ${r.label || r.command}`;
+    if (r.skipped) return `${name}\n[not run: not enough job time left]`;
+    if (r.ok) return `${name}\n[passed, exit code ${r.exit_code} after ${r.seconds}s; end of output]\n${cutStart(r.output || '', PASSED_OUTPUT_CHARS)}`;
+    return `${name}\n[${r.timed_out ? 'timed out' : `exit code ${r.exit_code}`} after ${r.seconds}s]\n${r.output}`;
+  });
+  const room = LOG_CHARS - top.length - 3;
+  return room > 0 ? `${top}\n\n${fitEnd(sections.join('\n\n'), room)}\n` : `${top}\n`;
+}
+
+/** The end of `text` with cutStart's marker included, in at most `max` characters: the marker takes room too. */
+function fitEnd(text, max) {
+  let keep = Math.max(0, max);
+  let out = cutStart(text, keep);
+  while (out.length > max && keep > 0) {
+    keep = Math.max(0, keep - (out.length - max));
+    out = cutStart(text, keep);
+  }
+  return out.length > max ? out.slice(out.length - Math.max(0, max)) : out;
 }
 
 /** Run the gate at the current head. Updates `state.l0`, and `state.head` and `state.push_pending` when fix_command committed. */
@@ -132,7 +187,8 @@ export async function runL0(rt, state) {
     skipped: Boolean(r.skipped),
     tail: clamp(sanitizeText(cutStart(r.output || '', 3000)), 3200),
   }));
-  writeFileSync(join(rt.stateDir, 'l0-log.txt'), cutStart(formatLog(results), 300000));
+  l0.results = results.map(lightResult);
+  writeFileSync(join(rt.stateDir, 'l0-log.txt'), formatLog(results, ranHead, s.status));
   l0.history.push({ kind: 'run', head: ranHead, status: s.status });
-  if (s.status === 'incomplete') l0.skipped_reason = 'not enough job time left to run every check';
+  l0.skipped_reason = s.status === 'incomplete' ? 'not enough job time left to run every check' : '';
 }
