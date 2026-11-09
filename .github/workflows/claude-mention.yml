@@ -164,11 +164,20 @@ jobs:
       # Always start from the default branch, never from the PR merge ref that
       # pull_request_review* events would check out. The action then checks out the PR head
       # (open PR) or creates a `claude/...` branch from the default branch (issue).
+      # persist-credentials is off: otherwise checkout v6 stores the read-only GITHUB_TOKEN
+      # header in a file under RUNNER_TEMP that git config pulls in through
+      # `includeIf.gitdir:...path`. The action removes only the local
+      # `http.<server>/.extraheader` entry and `include.path` files (`replaceCheckoutCredentials`
+      # in src/github/operations/git-config.ts), not `includeIf`, so that stale header would
+      # override the App token in the remote URL and the push would be made as
+      # github-actions[bot] and fail with HTTP 403. The header added by the "Authenticate
+      # git" step goes into the local config instead, where the action does remove it.
       - name: Checkout default branch
         if: steps.gate.outputs.skip != 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       # Standing instructions go in a file (--append-system-prompt-file) instead of the
       # `prompt` input: with `prompt` set, the action leaves tag mode for agent mode and
@@ -281,6 +290,27 @@ jobs:
             *CLR_HOOK_DENY:*) echo "Hook role $role denies forbidden calls." ;;
             *) echo "::error::The $role hook did not deny a forbidden call; refusing to run Claude."; exit 1 ;;
           esac
+
+      # The action's tag mode runs `setupBranch()` (git fetch / ls-remote against `origin`,
+      # src/github/operations/branch.ts) BEFORE `configureGitAuth()` (src/modes/tag/index.ts),
+      # and it only swaps in the App token afterwards. With persist-credentials off, those
+      # first git calls have no credentials and fail on a private repository. So put the
+      # read-only GITHUB_TOKEN into the LOCAL git config of this workspace, as the
+      # `http.<server>/.extraheader` entry that checkout < v6 used and that the action unsets
+      # (`git config --unset-all http.${GITHUB_SERVER_URL}/.extraheader`) before it sets the
+      # App token URL and pushes. The key must stay identical to the one the action unsets.
+      # The token lives only in `.git/config` inside the workspace (no file outside it, no
+      # credential helper). GITHUB_TOKEN is masked by the runner; the base64 form is masked
+      # explicitly. No `set -x`, so nothing prints the value.
+      - name: Authenticate git for the action's setup
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          basic=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$basic"
+          git config --local "http.${GITHUB_SERVER_URL}/.extraheader" "AUTHORIZATION: basic $basic"
 
       # anthropics/claude-code-action v1.0.269
       # No `prompt` input (tag mode). No `github_token` input: the action exchanges the OIDC
