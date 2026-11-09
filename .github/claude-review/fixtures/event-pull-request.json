@@ -1,0 +1,14 @@
+{
+  "action": "synchronize",
+  "number": 7,
+  "pull_request": {
+    "number": 7,
+    "head": { "sha": "__HEAD__", "ref": "feature" },
+    "base": { "sha": "__BASE__", "ref": "main" },
+    "user": { "login": "octo-author" },
+    "assignees": [],
+    "body": "Adds input validation."
+  },
+  "repository": { "full_name": "o/r" },
+  "sender": { "login": "octo-author", "type": "User" }
+}

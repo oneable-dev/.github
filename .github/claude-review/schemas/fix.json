@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "addressed": { "type": "array", "items": { "type": "string" } },
+    "not_addressed": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "reason": { "type": "string" }
+        },
+        "required": ["id", "reason"]
+      }
+    }
+  },
+  "required": ["addressed", "not_addressed"]
+}

@@ -1,0 +1,12 @@
+[
+  { "type": "system", "subtype": "init", "session_id": "11111111-aaaa-4aaa-8aaa-111111111111" },
+  { "type": "assistant", "message": { "content": [{ "type": "text", "text": "done" }] } },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "session_id": "11111111-aaaa-4aaa-8aaa-111111111111",
+    "num_turns": 4,
+    "structured_output": { "layer": "L1", "completed": true, "findings": [] }
+  }
+]

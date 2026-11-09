@@ -1,0 +1,10 @@
+[
+  { "type": "system", "subtype": "init", "session_id": "22222222-bbbb-4bbb-8bbb-222222222222" },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": true,
+    "session_id": "22222222-bbbb-4bbb-8bbb-222222222222",
+    "result": "API Error: 529 overloaded"
+  }
+]
