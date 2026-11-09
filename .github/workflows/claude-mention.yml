@@ -210,6 +210,7 @@ jobs:
 
           Git:
           - Never push to the default branch, force-push, or rewrite history. Use only the branch you are already on, and keep commits small and focused.
+          - Do not add Co-authored-by or Co-Authored-By trailers, or any other attribution, to commit messages or pull request text.
           EOF
           if [ "$ALLOW_CODE_CHANGES" = "true" ]; then
             printf '%s\n' '- You may edit files, commit, and push to that branch when the request asks for a change. Summarize what you changed in your reply.' >> "$INSTRUCTIONS_FILE"
@@ -278,8 +279,14 @@ jobs:
           mkdir -p "$HOOK_DIR"
           # The empty input directory is passed as an empty argument ('').
           command="$CLR_NODE $hook $role $GITHUB_WORKSPACE '' $log"
+          # `attribution` switches off the `Co-Authored-By: Claude` trailer and the PR footer that
+          # Claude Code adds by default. `--settings` outranks the repository's settings files.
+          # The `Co-authored-by: <user>` trailer comes from the action's own prompt, not from a
+          # setting, so the PreToolUse hook denies it and the standing instructions forbid it.
+          # The object form works on every Claude Code version (`attribution: false` needs v2.1.281+).
           jq -n --arg command "$command" '{
             disableAllHooks: false,
+            attribution: { commit: "", pr: "", sessionUrl: false },
             hooks: { PreToolUse: [ { matcher: "*", hooks: [ { type: "command", command: $command } ] } ] }
           }' > "$settings"
           # Self-check with a call the hook must deny in both roles.

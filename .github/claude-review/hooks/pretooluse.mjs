@@ -24,6 +24,8 @@
  * action's own prompt asks for, with path checks, and deny everything else (so rm/mv/cp/sed are denied):
  *   - mention:    reads, read-only git, Edit/MultiEdit/Write, `git add|rm|commit`, the push wrapper, MCP tools.
  *   - mention-ro: reads, read-only git and the MCP tools that only read or update the tracking comment.
+ * `git commit` messages and file-ops commit messages with a `Co-authored-by:` trailer are denied (rule
+ * `commit-attribution`): the action's prompt asks for one and has no switch to turn it off.
  * Both roles keep agents out of .git, `.github/**` (workflows included) and the other protected paths.
  */
 import fs from 'node:fs';
@@ -89,6 +91,15 @@ const NO_PUSH_BRANCHES = new Set(['main', 'master']);
 // because git accepts unambiguous abbreviations (`--outp` is `--output`).
 const FORBIDDEN_OPTIONS = ['--output', '--ext-diff', '--textconv', '--no-index'];
 const PUSH_COMMAND = 'git push origin HEAD';
+
+// Attribution trailer that claude-code-action's prompt tells the model to add to commits. The action has no
+// input to turn it off, so the hook denies it and the model retries without it. Matched anywhere in the text,
+// case-insensitively, which also catches a trailer written as a literal `\n` sequence inside a quoted message.
+const ATTRIBUTION_TRAILER = /co-authored-by\s*:/i;
+// Extra text appended to the deny reason of some rules, so the model knows how to retry.
+const RULE_HINTS = {
+  'commit-attribution': 'remove Co-authored-by trailers and commit again',
+};
 
 const deny = (rule) => ({ decision: 'deny', rule });
 const allow = (rule) => ({ decision: 'allow', rule });
@@ -475,6 +486,11 @@ function checkCommitArgs(args) {
  */
 function decideMentionBash(ctx, command, { readOnly }) {
   if (typeof command !== 'string' || command.trim() === '') return deny('bash-not-allowed');
+  // Checked on the raw command, before parsing: a trailer written with a literal `\n` inside double quotes
+  // would otherwise be reported as a metacharacter, and the model would not learn what to remove.
+  if (!readOnly && /^\s*git\s+commit(\s|$)/.test(command) && ATTRIBUTION_TRAILER.test(command)) {
+    return deny('commit-attribution');
+  }
   const parsed = parseMentionCommand(command);
   if (parsed.rule) return deny(parsed.rule);
   if (parsed.words.some((w) => w.expands)) return deny('bash-expansion');
@@ -520,6 +536,7 @@ function decideMentionMcp(tool, ti, ctx, readOnly) {
     if (!Array.isArray(paths) || paths.length === 0 || paths.some((p) => typeof p !== 'string' || p === '')) {
       return deny('mcp-bad-input');
     }
+    if (typeof ti.message === 'string' && ATTRIBUTION_TRAILER.test(ti.message)) return deny('commit-attribution');
     for (const p of paths) {
       const verdict = checkWritePath(ctx, p, MENTION_PROTECTED_SEGMENTS);
       if (verdict.decision === 'deny') return verdict;
@@ -627,7 +644,7 @@ function main() {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
-          permissionDecisionReason: `${MARKER}${result.rule}`,
+          permissionDecisionReason: `${MARKER}${result.rule}${RULE_HINTS[result.rule] ? `: ${RULE_HINTS[result.rule]}` : ''}`,
         },
       }),
     );

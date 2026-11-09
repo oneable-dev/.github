@@ -487,8 +487,7 @@ test('mention: git rm denies protected paths, also inside directories', () => {
 test('mention: git commit takes a message and --signoff only', () => {
   for (const command of [
     'git commit -m "fix bug"', "git commit -m 'fix (scope): a; b | c & d'", 'git commit --message="x"', 'git commit --message x',
-    'git commit -s -m x', 'git commit -m "title" -m "Co-authored-by: Ada <1+ada@users.noreply.github.com>"',
-    'git commit -m "title\n\nCo-authored-by: Ada <1+ada@users.noreply.github.com>"', "git commit -m '$HOME and `id` stay literal'",
+    'git commit -s -m x', "git commit -m '$HOME and `id` stay literal'",
     'git commit -m "-a"',
   ]) {
     assertAllow(menBash(command));
@@ -505,6 +504,26 @@ test('mention: git commit takes a message and --signoff only', () => {
   assertDeny(menBash('git commit -m x; id'), 'bash-metachar');
   assertDeny(menBash('git commit -m (x)'), 'bash-metachar');
   assertDeny(menBash('git commit -m "x'), 'bash-syntax');
+});
+test('mention: git commit with a Co-authored-by trailer is denied as commit-attribution', () => {
+  const ada = 'Ada <1+ada@users.noreply.github.com>';
+  for (const command of [
+    `git commit -m "title" -m "Co-authored-by: ${ada}"`,
+    `git commit -m "title\n\nCo-authored-by: ${ada}"`, // real newlines inside the quotes
+    `git commit -m "title\\n\\nCo-authored-by: ${ada}"`, // literal backslash-n, the form the action's prompt shows
+    `git commit -m 'title\\n\\nCo-authored-by: ${ada}'`,
+    `git commit --message="x\n\nCO-AUTHORED-BY: ${ada}"`,
+    `git commit --message=x -m "co-authored-by:${ada}"`,
+    `git commit -s -m "x" -m "Co-Authored-By : ${ada}"`,
+    `git commit -m "x co-authored-by: ${ada}"`,
+  ]) {
+    assertDeny(menBash(command), 'commit-attribution');
+  }
+  // Without the trailer, the same shapes keep their old verdicts.
+  assertAllow(menBash('git commit -m "title" -m "body about co-authors"'));
+  assertDeny(menBash('git commit -m "title\\nbody"'), 'bash-metachar');
+  // Other commands and the read-only role are not affected by this rule.
+  assertDeny(roBash(`git commit -m "x" -m "Co-authored-by: ${ada}"`), 'bash-not-allowed');
 });
 test('mention-ro: git add, rm, commit and push are denied', () => {
   for (const command of ['git add src/a.ts', 'git rm src/a.ts', 'git commit -m x', `${wrapper} origin HEAD`]) {
@@ -613,6 +632,16 @@ test('mention: file-ops MCP tools get the write path rules, mention-ro denies th
   assertDeny(menRo('mcp__github_file_ops__commit_files', { files: ['src/a.ts'], message: 'x' }), 'tool-not-allowed');
   assertDeny(menRo('mcp__github_file_ops__delete_files', { paths: ['src/a.ts'], message: 'x' }), 'tool-not-allowed');
 });
+test('mention: file-ops commit messages with a Co-authored-by trailer are denied', () => {
+  const ada = 'Ada <1+ada@users.noreply.github.com>';
+  for (const tool of ['mcp__github_file_ops__commit_files', 'mcp__github_file_ops__delete_files']) {
+    const field = tool.endsWith('commit_files') ? { files: ['src/a.ts'] } : { paths: ['src/a.ts'] };
+    for (const message of [`x\n\nCo-authored-by: ${ada}`, `x\\n\\nco-authored-by: ${ada}`, `Co-Authored-By: ${ada}`]) {
+      assertDeny(men(tool, { ...field, message }), 'commit-attribution');
+    }
+    assertAllow(men(tool, { ...field, message: 'x\n\nbody' }));
+  }
+});
 test('mention: the other roles are unchanged (LS, MCP and ToolSearch stay denied for review and fix)', () => {
   for (const call of [review, fix]) {
     for (const tool of ['LS', 'ToolSearch', 'mcp__github_comment__update_claude_comment']) assertDeny(call(tool, { body: 'x' }), 'tool-not-allowed');
@@ -640,8 +669,15 @@ test('CLI: mention roles deny with the rule marker, allow silently, and read GIT
   const pushed = call('mention', pushCommand, { GITHUB_ACTION_PATH: '/opt/ca' });
   assert.equal(pushed.status, 0, pushed.stderr);
   assert.equal(pushed.stdout, '');
+  const attributed = call('mention', { tool_name: 'Bash', tool_input: { command: 'git commit -m "x\\n\\nCo-authored-by: A <b>"' } });
+  assert.equal(attributed.status, 0, attributed.stderr);
+  assert.equal(
+    JSON.parse(attributed.stdout).hookSpecificOutput.permissionDecisionReason,
+    'CLR_HOOK_DENY:commit-attribution: remove Co-authored-by trailers and commit again',
+  );
   const rows = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-  assert.deepEqual(rows.map((r) => r.decision), ['deny', 'deny', 'allow', 'deny', 'allow']);
+  assert.deepEqual(rows.map((r) => r.decision), ['deny', 'deny', 'allow', 'deny', 'allow', 'deny']);
+  assert.equal(rows[5].rule, 'commit-attribution');
 });
 
 // Input validation
